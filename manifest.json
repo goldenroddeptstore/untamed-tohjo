@@ -1,0 +1,20 @@
+{
+  "id": "overworldmons",
+  "name": "Untamed Tohjo",
+  "version": "0.16.9",
+  "api": 2,
+  "entry": "main.lua",
+  "profile": "content",
+  "game_version": ">=0.0.0-dev <1.0.0",
+  "category": "GAMEPLAY",
+  "priority": 100,
+  "permissions": ["engine_internals"],
+  "dependencies": [],
+  "optional_dependencies": [],
+  "conflicts": [],
+  "incompatible": [],
+  "games": ["gen2"],
+  "experimental": false,
+  "github": "goldenroddeptstore/untamed-tohjo",
+  "description": "Wild Pokemon wander the overworld and battle on touch, with visible shinies, chaining, and a GBC-style follower with a life of its own."
+}

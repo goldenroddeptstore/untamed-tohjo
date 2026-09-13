@@ -1,0 +1,6 @@
+{
+  "sparkle": {
+    "normal": ["#000000", "#aaaaaa", "#ffffff"],
+    "shades": [0, 85, 170]
+  }
+}

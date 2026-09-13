@@ -1,0 +1,52 @@
+name: Build and release mod package
+
+on:
+  push:
+    branches: [master]
+    paths: ["main.lua", "manifest.json", "assets/**"]
+    tags: ["v*"]
+  pull_request:
+    paths: ["main.lua", "manifest.json", "assets/**"]
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.manifest.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read manifest version
+        id: manifest
+        run: |
+          version=$(python3 -c "import json; print(json.load(open('manifest.json'))['version'])")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Package mod
+        run: |
+          mkdir -p dist
+          zip -X -r "dist/overworldmons-${{ steps.manifest.outputs.version }}.zip" \
+            manifest.json main.lua assets
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: overworldmons-${{ steps.manifest.outputs.version }}
+          path: dist/overworldmons-${{ steps.manifest.outputs.version }}.zip
+
+  release:
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: overworldmons-${{ needs.package.outputs.version }}
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/overworldmons-${{ needs.package.outputs.version }}.zip
+          generate_release_notes: true
