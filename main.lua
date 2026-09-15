@@ -1282,6 +1282,46 @@ local function setupWild(mod, Chain, Roamers)
       == (map.borderBlock or 0)
   end
 
+  -- Gold's own CheckGrassCollision (the routine that actually rolls a wild
+  -- encounter on a step) reads a WIDER collision set than Permissions.isGrass
+  -- does (src/world/gen2/Permissions.lua's own comment spells this out:
+  -- "NOT the same list as GRASS above, and the difference is load bearing").
+  -- COLL_GRASS_48..4C ($48-$4c) is real cart-verbatim encounter terrain that
+  -- isGrass never recognizes -- confirmed 2026-09-15 against a real Route 13
+  -- report: a wide, visually distinct pale patch triggers native encounters
+  -- immediately, but a first (and second) attempt at this fix (v0.17.4
+  -- unmodified, then v0.17.6) both gated spawns to isGrassCell alone and
+  -- missed it entirely. `map:cellTile` (Gen2Compat's exposed alias for the
+  -- raw COLL_* byte, despite the Gen-1-flavored name) is what a mod has to
+  -- reach for this, since isGrassCell can't see it.
+  local EXTRA_GRASS_COLL = {
+    [0x48] = true, [0x49] = true, [0x4a] = true, [0x4b] = true, [0x4c] = true,
+  }
+  local function isEncounterGrassCell(map, cx, cy)
+    if map.isGrassCell and map:isGrassCell(cx, cy) then return true end
+    if map.cellTile then
+      local coll = map:cellTile(cx, cy)
+      if coll and EXTRA_GRASS_COLL[coll % 256] then return true end
+    end
+    return false
+  end
+
+  -- Keeps solid wild mons off the shore (would block a 1-tile crossing).
+  local function isShoreCell(map, cx, cy, terrain)
+    for _, d in ipairs(NEIGH) do
+      local nx, ny = cx + d[1], cy + d[2]
+      local nWater = map.isWaterCell and map:isWaterCell(nx, ny)
+      if terrain == "water" then
+        if not nWater and map.isWalkableCell and map:isWalkableCell(nx, ny) then
+          return true
+        end
+      elseif nWater then
+        return true
+      end
+    end
+    return false
+  end
+
   local function localRegion(map, pcx, pcy)
     local land, water = {}, {}
     if not (map and map.isWalkableCell and map.widthCells) then
@@ -1338,6 +1378,74 @@ local function setupWild(mod, Chain, Roamers)
       end
     end
     return land, water
+  end
+
+  -- Groups a flat cell list into contiguous 4-neighbor patches (BUGS.md #16/#18:
+  -- treat every encounter patch on equal footing instead of one pool weighted by
+  -- raw candidate count, which let one big water body or grass field starve
+  -- smaller patches nearby).
+  local function labelPatches(cells)
+    local index = {}
+    for i, c in ipairs(cells) do index[c[2] * 1024 + c[1]] = i end
+    local visited, patches = {}, {}
+    for i, c in ipairs(cells) do
+      local key = c[2] * 1024 + c[1]
+      if not visited[key] then
+        visited[key] = true
+        local patch, stack = {}, { c }
+        while #stack > 0 do
+          local cell = stack[#stack]; stack[#stack] = nil
+          patch[#patch + 1] = cell
+          for _, d in ipairs(NEIGH) do
+            local nx, ny = cell[1] + d[1], cell[2] + d[2]
+            local nk = ny * 1024 + nx
+            local ni = index[nk]
+            if ni and not visited[nk] then
+              visited[nk] = true
+              stack[#stack + 1] = cells[ni]
+            end
+          end
+        end
+        patches[#patches + 1] = patch
+      end
+    end
+    return patches
+  end
+
+  -- BUGS.md #18's own pitch: a 4+ tile patch floors at 2, +1 per additional 4
+  -- tiles. Extended down to a floor of 1 for 1-3 tile patches so a tiny patch
+  -- is never silently starved outright.
+  local function patchQuota(size)
+    if size <= 0 then return 0 end
+    if size < 4 then return 1 end
+    return 2 + math.floor((size - 4) / 4)
+  end
+
+  -- Largest-remainder proportional trim: when total quota demand exceeds what
+  -- the overall on-screen cap allows for this pass, shrink every patch's
+  -- allocation in proportion to its own quota (a proxy for its size) rather
+  -- than emptying small patches first.
+  local function allocateProportional(allocs, totalQuota, need)
+    if totalQuota <= 0 or need <= 0 then
+      for _, a in ipairs(allocs) do a.alloc = 0 end
+      return
+    end
+    if totalQuota <= need then
+      for _, a in ipairs(allocs) do a.alloc = a.quota end
+      return
+    end
+    local sumFloors = 0
+    for _, a in ipairs(allocs) do
+      local exact = a.quota * need / totalQuota
+      a.alloc = math.floor(exact)
+      a.remainder = exact - a.alloc
+      sumFloors = sumFloors + a.alloc
+    end
+    local remaining = need - sumFloors
+    table.sort(allocs, function(x, y) return x.remainder > y.remainder end)
+    for i = 1, remaining do
+      if allocs[i] then allocs[i].alloc = allocs[i].alloc + 1 end
+    end
   end
 
   local function eligibleDist(mapId, terrain)
@@ -1461,9 +1569,11 @@ local function setupWild(mod, Chain, Roamers)
   end
 
   local live = {}
+  local liveById = {} -- npcId -> entry, kept in sync with `live`
   local activeMapId
   local grassDist, waterDist
-  local regionLand, regionWater
+  local regionLand, regionWater, regionEligible, regionTotalQuota
+  local regionFloodAtX, regionFloodAtY
   local stepTick = 0
   local topUpClock = 0
   local TOPUP_INTERVAL = 1
@@ -1501,6 +1611,7 @@ local function setupWild(mod, Chain, Roamers)
     local w = live[i]
     if w and w.npcId then mod.world:removeNpc(w.npcId) end
     if w and w.sparkleNpcId then mod.world:removeNpc(w.sparkleNpcId) end
+    if w and w.npcId then liveById[w.npcId] = nil end
     table.remove(live, i)
   end
 
@@ -1512,14 +1623,6 @@ local function setupWild(mod, Chain, Roamers)
     local h = w.index and mod.world:npc(activeMapId, w.index)
     if h and h.npc then return h.npc.cellX, h.npc.cellY, h.npc end
     return nil
-  end
-
-  local function liveIds()
-    local s = {}
-    for _, w in ipairs(live) do
-      if w.npcId then s[w.npcId] = w end
-    end
-    return s
   end
 
   local function playerCell()
@@ -1568,7 +1671,7 @@ local function setupWild(mod, Chain, Roamers)
 
     local h = index and mod.world:npc(mapId, index)
     if h and h.npc then
-      h.npc.passable = true
+      h.npc.passable = false -- solid; native collision handles occupancy now
       if world and world.applySpritePalette then world:applySpritePalette(h.npc) end
     end
 
@@ -1582,6 +1685,7 @@ local function setupWild(mod, Chain, Roamers)
         + r() * (DECAY_MAX_SECONDS - DECAY_MIN_SECONDS)
     end
     live[#live + 1] = entry
+    liveById[npcId] = entry
     if shiny then
       mod.log:info("overworldmons: SHINY wild %s spawned on %s", species, mapId)
       local sSlot = freeSparkleSlot()
@@ -1597,7 +1701,7 @@ local function setupWild(mod, Chain, Roamers)
           local sIndex = tonumber(sNpcId:match("_obj_(%d+)$"))
           local sh = sIndex and mod.world:npc(mapId, sIndex)
           if sh and sh.npc then
-            sh.npc.passable = true
+            sh.npc.passable = true -- visual overlay riding the host's cell, never solid
             if world and world.applySpritePalette then world:applySpritePalette(sh.npc) end
           end
           entry.sparkleNpcId, entry.sparkleIndex, entry.sparkleSlot =
@@ -1613,7 +1717,8 @@ local function setupWild(mod, Chain, Roamers)
     ensureEncounterAlias()  -- data may not have been ready at entry-chunk time
     grassDist, waterDist, activeMapId = nil, nil, nil
     fishLevels = nil
-    regionLand, regionWater = nil, nil
+    regionLand, regionWater, regionEligible, regionTotalQuota = nil, nil, nil, nil
+    regionFloodAtX, regionFloodAtY = nil, nil
     if not mapId then return false end
     grassDist = eligibleDist(mapId, "grass")
     waterDist = eligibleDist(mapId, "water")
@@ -1709,16 +1814,18 @@ local function setupWild(mod, Chain, Roamers)
     local npcIndex = tonumber(npcId:match("_obj_(%d+)$"))
     local h = npcIndex and mod.world:npc(activeMapId, npcIndex)
     if h and h.npc then
-      h.npc.passable = true
+      h.npc.passable = false
       if world and world.applySpritePalette then world:applySpritePalette(h.npc) end
     end
 
-    live[#live + 1] = {
+    local entry = {
       npcId = npcId, index = npcIndex, slot = rslot,
       species = species, level = level, terrain = terrain,
       dvs = slot.dvs, shiny = shiny,
       roamer = true, roamerIndex = index,
     }
+    live[#live + 1] = entry
+    liveById[npcId] = entry
     mod.log:info("overworldmons: roamer %s appeared on %s (%d,%d)%s",
       species, activeMapId, cell[1], cell[2], shiny and " SHINY" or "")
   end
@@ -1734,7 +1841,8 @@ local function setupWild(mod, Chain, Roamers)
         local d = cheb(c[1], c[2], pcx, pcy)
         if d >= MIN_SPAWN_DIST and d <= placementRadius
             and not taken[c[2] * 1024 + c[1]]
-            and not (map.warpAt and map:warpAt(c[1], c[2])) then
+            and not (map.warpAt and map:warpAt(c[1], c[2]))
+            and not isShoreCell(map, c[1], c[2], terrain) then
           out[#out + 1] = { c, terrain }
         end
       end
@@ -1767,10 +1875,27 @@ local function setupWild(mod, Chain, Roamers)
 
     local viewRadius, placementRadius, despawnRadius = windowRadii()
 
-    if not regionLand then
+    -- Self-healing re-flood: if the flood computed from the player's entry
+    -- cell (or wherever they were standing on the last attempt) ends up
+    -- having nothing SPAWNABLE in it -- confirmed on a real Route 35 entry
+    -- from Route 36: the player lands in a small, real, walkable alcove
+    -- (localRegion finds it fine) that simply has no grass tiles in it at
+    -- all -- the OLD code cached that dead-end result for the rest of the
+    -- map visit and never tried again, so spawns stayed stuck at zero even
+    -- after the player walked elsewhere on the same map. Now: a flood that
+    -- comes up empty of spawnable land/water only "sticks" for the exact
+    -- cell it was computed from; any actual player movement re-attempts it
+    -- from the new position, bounded by real movement rather than the
+    -- periodic topUpClock tick (so it can't cost a fresh BFS every second
+    -- while the player is stationary in a genuinely grass/water-free spot
+    -- like a town).
+    local needFlood = not regionLand
+      or (regionEligible == false and not (regionFloodAtX == pcx and regionFloodAtY == pcy))
+    if needFlood then
       regionLand, regionWater = localRegion(map, pcx, pcy)
+      regionFloodAtX, regionFloodAtY = pcx, pcy
     end
-    local landRaw, water = regionLand, regionWater
+    local landRaw, water = regionLand or {}, regionWater or {}
     local land = landRaw
     if not grassDist then land = {} end
     if not waterDist then water = {} end
@@ -1788,18 +1913,23 @@ local function setupWild(mod, Chain, Roamers)
     end
     do
       local world = mod.game and mod.game.world
-      local mine = liveIds()
       for _, npc in ipairs(world and world.npcs or {}) do
-        if not npc.passable and not mine[npc.id] then
+        if not npc.passable and not liveById[npc.id] then
           taken[npc.cellY * 1024 + npc.cellX] = true
         end
       end
     end
 
+    -- v0.17.7: gate to isEncounterGrassCell (isGrassCell + the COLL_GRASS_48
+    -- family), not isGrassCell alone -- see that helper's comment for why. A
+    -- v0.17.5 attempt at "fix the dead zone" fell back to ungated walkable
+    -- land instead, which was wrong for a different reason (reverted in
+    -- v0.17.6): dumps wanderers on genuinely non-encounter tiles. This is
+    -- the actual root cause both of those attempts missed.
     if grassDist and #land > 0 and map.isGrassCell then
       local g = {}
       for _, c in ipairs(land) do
-        if map:isGrassCell(c[1], c[2]) then g[#g + 1] = c end
+        if isEncounterGrassCell(map, c[1], c[2]) then g[#g + 1] = c end
       end
       if #g > 0 then
         land = g
@@ -1812,11 +1942,43 @@ local function setupWild(mod, Chain, Roamers)
     syncRoamers(map, pcx, pcy, land, water, taken, placementRadius)
 
     local eligible = #land + #water
+    regionEligible = eligible > 0
     if eligible == 0 then return end
-    local target = math.min(densityCap(placementRadius), math.floor(eligible / CELLS_PER))
-    if target < 2 then target = 2 end
 
-    local function candidates(list)
+    -- `totalQuota` (the region's real carrying capacity) depends only on
+    -- `land`/`water` -- the whole-region habitat lists -- never on the
+    -- player's position or which cells are currently taken. So it's stable
+    -- for as long as regionLand/regionWater are (i.e. until the next
+    -- `needFlood`), and can be cached instead of recomputed via a full
+    -- patch-labeling BFS on every topUp tick (every ~1s). This matters even
+    -- once the wanderer pool is full (see below), AND when the habitat is
+    -- simply too small to ever fill the pool -- without this cache, a small
+    -- pocket of grass that tops out at e.g. 4 mons would still pay for the
+    -- full BFS forever, every tick, since `#live < POOL` never stops being
+    -- true. Was a real music-stutter source on weak hardware.
+    if needFlood then
+      regionTotalQuota = 0
+      for _, list in ipairs({ land, water }) do
+        for _, p in ipairs(labelPatches(list)) do
+          regionTotalQuota = regionTotalQuota + patchQuota(#p)
+        end
+      end
+    end
+
+    local target = math.min(densityCap(placementRadius), regionTotalQuota or 0)
+    if target < 2 then target = 2 end
+    local nearby = 0
+    for _, w in ipairs(live) do
+      local cx, cy = npcCell(w)
+      if cx and cheb(cx, cy, pcx, pcy) <= despawnRadius then nearby = nearby + 1 end
+    end
+    -- Cheap ceiling check using the cached quota above -- skips the
+    -- expensive per-tick BFS/shore-check pass below entirely once the area
+    -- is at capacity (whether that capacity is POOL or the habitat's own
+    -- smaller ceiling).
+    if math.min(target - nearby, POOL - #live) <= 0 then return end
+
+    local function windowFilter(list)
       local out = {}
       for _, c in ipairs(list) do
         local d = cheb(c[1], c[2], pcx, pcy)
@@ -1828,21 +1990,53 @@ local function setupWild(mod, Chain, Roamers)
       end
       return out
     end
-    local landC, waterC = candidates(land), candidates(water)
 
-    local nearby = 0
-    for _, w in ipairs(live) do
-      local cx, cy = npcCell(w)
-      if cx and cheb(cx, cy, pcx, pcy) <= despawnRadius then nearby = nearby + 1 end
+    -- Patches are labeled from the TRUE, whole-region habitat lists (`land`/
+    -- `water`, already flooded for the whole reachable area by localRegion),
+    -- NOT the window-filtered candidate lists above -- the player-centered
+    -- MIN_SPAWN_DIST exclusion and each live wanderer's MIN_WANDERER_SPACING
+    -- ring otherwise chop one real contiguous field into several small
+    -- fragments, each capped at patchQuota's tiny per-fragment floor. That
+    -- undercounted badly on real routes (regression found on Route 37:
+    -- reported "only 2 Pokemon ever spawn"). Quota is computed from the real
+    -- patch; `windowFilter` is then only used to find which of that patch's
+    -- cells are actually placeable this pass.
+    local allocs = {}
+    local visibleQuota = 0
+    local function addPatches(list, kind)
+      for _, p in ipairs(labelPatches(list)) do
+        local q = patchQuota(#p)
+        local pickable = {}
+        for _, c in ipairs(windowFilter(p)) do
+          if not isShoreCell(map, c[1], c[2], kind) then
+            pickable[#pickable + 1] = c
+          end
+        end
+        if #pickable > 0 then
+          allocs[#allocs + 1] = { cells = pickable, quota = q, kind = kind }
+          visibleQuota = visibleQuota + q
+        end
+      end
     end
+    addPatches(land, "land")
+    addPatches(water, "water")
+
     local need = math.min(target - nearby, POOL - #live)
     if need <= 0 then return end
 
     local r = rng()
-    local function takeRandom(l)
-      if #l == 0 then return nil end
-      local i = math.floor(r() * #l) + 1
-      local c = l[i]; l[i] = l[#l]; l[#l] = nil
+    local landCount, waterCount = 0, 0
+    for _, a in ipairs(allocs) do
+      if a.kind == "water" then waterCount = waterCount + #a.cells
+      else landCount = landCount + #a.cells end
+    end
+
+    allocateProportional(allocs, visibleQuota, need)
+
+    local function takeRandomFrom(list)
+      if #list == 0 then return nil end
+      local i = math.floor(r() * #list) + 1
+      local c = list[i]; list[i] = list[#list]; list[#list] = nil
       return c
     end
     local function pruneNear(list, cx, cy)
@@ -1854,28 +2048,26 @@ local function setupWild(mod, Chain, Roamers)
       end
       return out
     end
-    for _ = 1, need do
-      local pickWater
-      if #waterC == 0 then pickWater = false
-      elseif #landC == 0 then pickWater = true
-      else pickWater = r() * (#landC + #waterC) >= #landC end
-      local c = pickWater and takeRandom(waterC) or takeRandom(landC)
-      if not c then
-        pickWater = not pickWater
-        c = pickWater and takeRandom(waterC) or takeRandom(landC)
-      end
-      if not c then break end
-      landC = pruneNear(landC, c[1], c[2])
-      waterC = pruneNear(waterC, c[1], c[2])
-      if pickWater then
-        spawnOne(activeMapId, c, "water", waterDist, r)
-      else
-        spawnOne(activeMapId, c, "land", grassDist, r)
+    for _, a in ipairs(allocs) do
+      local pool = a.cells
+      local picked = 0
+      while picked < a.alloc and #pool > 0 do
+        local c = takeRandomFrom(pool)
+        if c then
+          pool = pruneNear(pool, c[1], c[2])
+          if a.kind == "water" then
+            spawnOne(activeMapId, c, "water", waterDist, r)
+          else
+            spawnOne(activeMapId, c, "land", grassDist, r)
+          end
+          picked = picked + 1
+        end
       end
     end
     mod.log:info(
-      "overworldmons: %s topUp @%d,%d -> %d live (view=%d place=%d %d land / %d water cand)",
-      activeMapId, pcx, pcy, #live, viewRadius, placementRadius, #landC, #waterC)
+      "overworldmons: %s topUp @%d,%d -> %d live (view=%d place=%d %d land / %d water cand, %d patches/%d quota)",
+      activeMapId, pcx, pcy, #live, viewRadius, placementRadius, landCount, waterCount,
+      #allocs, regionTotalQuota)
   end
 
   mod.events:on("map.entered", function(ev)
@@ -1895,7 +2087,8 @@ local function setupWild(mod, Chain, Roamers)
     despawnAll()
     grassDist, waterDist, activeMapId = nil, nil, nil
     fishLevels = nil
-    regionLand, regionWater = nil, nil
+    regionLand, regionWater, regionEligible, regionTotalQuota = nil, nil, nil, nil
+    regionFloodAtX, regionFloodAtY = nil, nil
   end)
 
   mod.events:on("roamer.moved", function(ev)
@@ -1908,29 +2101,24 @@ local function setupWild(mod, Chain, Roamers)
     if ev and ev.index then removeRoamerEntry(ev.index) end
   end)
 
+  -- Called from movement.collision's player branch on a bump, not touch.
+  local function beginEncounter(i, w)
+    removeWanderer(i)
+    local realWorld = mod.game and mod.game.world
+    if realWorld then realWorld.heldDir = nil end
+    pendingTouchClock = clock()
+    if w.roamer then
+      pending = { roamer = true, index = w.roamerIndex,
+        species = w.species, level = w.level }
+    else
+      pending = { species = w.species, level = w.level, dvs = w.dvs }
+    end
+    mod.log:info("overworldmons: bumped %s%s (Lv %d)", w.species,
+      w.roamer and " [roamer]" or "", w.level)
+  end
+
   mod.events:on("world.stepped", function(ev)
     if ev.mapId ~= activeMapId then return end
-
-    if not pending then
-      for i, w in ipairs(live) do
-        local cx, cy = npcCell(w)
-        if cx == ev.x and cy == ev.y then
-          removeWanderer(i)
-          local realWorld = mod.game and mod.game.world
-          if realWorld then realWorld.heldDir = nil end
-          pendingTouchClock = clock()
-          if w.roamer then
-            pending = { roamer = true, index = w.roamerIndex,
-              species = w.species, level = w.level }
-          else
-            pending = { species = w.species, level = w.level, dvs = w.dvs }
-          end
-          mod.log:info("overworldmons: touched %s%s (Lv %d)", w.species,
-            w.roamer and " [roamer]" or "", w.level)
-          return
-        end
-      end
-    end
 
     stepTick = stepTick + 1
     if stepTick % STEP_THROTTLE == 0 then
@@ -2048,25 +2236,34 @@ local function setupWild(mod, Chain, Roamers)
     return next_(tables, ctx)
   end)
 
+  -- Wild mons are solid now; this only handles the player's bump and wander/habitat rules.
   mod.hooks:wrap("movement.collision", function(next_, allowed, ctx)
-    local mover = ctx and ctx.mover
-    local id = mover and mover.id
-    if not (id and activeMapId and ctx.map) then return next_(allowed, ctx) end
-    local ids = liveIds()
-    local self_ = ids[id]
-    if not self_ then
-      local tx, ty = ctx.toX, ctx.toY
-      local w = mod.game and mod.game.world
-      for _, npc in ipairs(w and w.npcs or {}) do
-        if ids[npc.id] then
-          if npc.cellX == tx and npc.cellY == ty then return next_(false, ctx) end
-          if npc.moving and npc.targetX == tx and npc.targetY == ty then
-            return next_(false, ctx)
+    if not (activeMapId and ctx.map) then return next_(allowed, ctx) end
+    local mover = ctx.mover
+    local world = mod.game and mod.game.world
+    local player = world and world.player
+
+    if mover and mover == player then
+      if not pending and allowed == false and ctx.reason == "entity" then
+        local tx, ty = ctx.toX, ctx.toY
+        for i, w in ipairs(live) do
+          local cx, cy = npcCell(w)
+          if cx == tx and cy == ty then
+            beginEncounter(i, w)
+            break
           end
         end
       end
       return next_(allowed, ctx)
     end
+
+    local id = mover and mover.id
+    local self_ = id and liveById[id]
+    if not self_ then return next_(allowed, ctx) end
+    -- Native refuses water tiles as "tile" (not land-walkable) -- that's the
+    -- one veto a water wanderer needs lifted, so it's not respected here.
+    -- Every other refusal (entity/radius/warp/bounds) still is.
+    if not allowed and ctx.reason ~= "tile" then return next_(allowed, ctx) end
 
     local map = ctx.map
     local tx, ty = ctx.toX, ctx.toY
@@ -2077,31 +2274,14 @@ local function setupWild(mod, Chain, Roamers)
     else
       if onWater then return next_(false, ctx) end
       if isFillerCell(map, tx, ty) then return next_(false, ctx) end
-      if map.isGrassCell and map:isGrassCell(mover.cellX, mover.cellY)
-          and not map:isGrassCell(tx, ty) then
+      if map.isGrassCell and isEncounterGrassCell(map, mover.cellX, mover.cellY)
+          and not isEncounterGrassCell(map, tx, ty) then
         return next_(false, ctx)
       end
     end
 
     if ctx.dir and not crossable(map, ctx.fromX, ctx.fromY, ctx.dir) then
       return next_(false, ctx)
-    end
-
-    if map.warpAt and map:warpAt(tx, ty) then return next_(false, ctx) end
-    if mover.inRadius and not mover:inRadius(tx, ty) then
-      return next_(false, ctx)
-    end
-
-    local _, px, py = playerCell()
-    if px == tx and py == ty then return next_(false, ctx) end
-    local world = mod.game and mod.game.world
-    for _, npc in ipairs(world and world.npcs or {}) do
-      if npc.id ~= id and ids[npc.id] then
-        if npc.cellX == tx and npc.cellY == ty then return next_(false, ctx) end
-        if npc.moving and npc.targetX == tx and npc.targetY == ty then
-          return next_(false, ctx)
-        end
-      end
     end
 
     if self_.terrain == "water" then return next_(true, ctx) end
