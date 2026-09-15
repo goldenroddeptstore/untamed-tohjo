@@ -1282,6 +1282,30 @@ local function setupWild(mod, Chain, Roamers)
       == (map.borderBlock or 0)
   end
 
+  -- Gold's own CheckGrassCollision (the routine that actually rolls a wild
+  -- encounter on a step) reads a WIDER collision set than Permissions.isGrass
+  -- does (src/world/gen2/Permissions.lua's own comment spells this out:
+  -- "NOT the same list as GRASS above, and the difference is load bearing").
+  -- COLL_GRASS_48..4C ($48-$4c) is real cart-verbatim encounter terrain that
+  -- isGrass never recognizes -- confirmed 2026-09-15 against a real Route 13
+  -- report: a wide, visually distinct pale patch triggers native encounters
+  -- immediately, but a first (and second) attempt at this fix (v0.17.4
+  -- unmodified, then v0.17.6) both gated spawns to isGrassCell alone and
+  -- missed it entirely. `map:cellTile` (Gen2Compat's exposed alias for the
+  -- raw COLL_* byte, despite the Gen-1-flavored name) is what a mod has to
+  -- reach for this, since isGrassCell can't see it.
+  local EXTRA_GRASS_COLL = {
+    [0x48] = true, [0x49] = true, [0x4a] = true, [0x4b] = true, [0x4c] = true,
+  }
+  local function isEncounterGrassCell(map, cx, cy)
+    if map.isGrassCell and map:isGrassCell(cx, cy) then return true end
+    if map.cellTile then
+      local coll = map:cellTile(cx, cy)
+      if coll and EXTRA_GRASS_COLL[coll % 256] then return true end
+    end
+    return false
+  end
+
   -- Keeps solid wild mons off the shore (would block a 1-tile crossing).
   local function isShoreCell(map, cx, cy, terrain)
     for _, d in ipairs(NEIGH) do
@@ -1896,10 +1920,16 @@ local function setupWild(mod, Chain, Roamers)
       end
     end
 
+    -- v0.17.7: gate to isEncounterGrassCell (isGrassCell + the COLL_GRASS_48
+    -- family), not isGrassCell alone -- see that helper's comment for why. A
+    -- v0.17.5 attempt at "fix the dead zone" fell back to ungated walkable
+    -- land instead, which was wrong for a different reason (reverted in
+    -- v0.17.6): dumps wanderers on genuinely non-encounter tiles. This is
+    -- the actual root cause both of those attempts missed.
     if grassDist and #land > 0 and map.isGrassCell then
       local g = {}
       for _, c in ipairs(land) do
-        if map:isGrassCell(c[1], c[2]) then g[#g + 1] = c end
+        if isEncounterGrassCell(map, c[1], c[2]) then g[#g + 1] = c end
       end
       if #g > 0 then
         land = g
@@ -2244,8 +2274,8 @@ local function setupWild(mod, Chain, Roamers)
     else
       if onWater then return next_(false, ctx) end
       if isFillerCell(map, tx, ty) then return next_(false, ctx) end
-      if map.isGrassCell and map:isGrassCell(mover.cellX, mover.cellY)
-          and not map:isGrassCell(tx, ty) then
+      if map.isGrassCell and isEncounterGrassCell(map, mover.cellX, mover.cellY)
+          and not isEncounterGrassCell(map, tx, ty) then
         return next_(false, ctx)
       end
     end

@@ -1,7 +1,7 @@
 {
   "id": "overworldmons",
   "name": "Untamed Tohjo",
-  "version": "0.17.4",
+  "version": "0.17.7",
   "api": 2,
   "entry": "main.lua",
   "profile": "content",
