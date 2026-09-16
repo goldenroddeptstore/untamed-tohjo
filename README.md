@@ -16,6 +16,7 @@ Grab the latest packaged `.zip` from [Releases](../../releases), unzip it into y
 ## Credits
 
 - Overworld sprites by **MegamanOmega**, with palette edits by **ShockSlayer** and the **Crystal Clear** team.
+- Pokéball drop sprite by **ShockSlayer** and the **Crystal Clear** team.
 - Emoticons by **FrenchOrange**.
 - Inspired by the **Wilds of Kanto** team's work.
 - Chaining system inspired by **Pokeabbie's Emerald Rogue**.

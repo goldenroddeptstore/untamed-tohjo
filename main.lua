@@ -14,6 +14,8 @@ local ZoomMod
 
 local Encounter
 
+local Specials
+
 local function unownLetter(mon)
   if not (Unown and mon) then return nil end
   local idx = Unown.monLetter(mon)
@@ -395,6 +397,9 @@ local NPC_MOVE_STAND = 6
 
 local followerNpcId, followerIndex, followerMapId
 local followerTrail, followerGoal
+local pokeballAnim -- in-flight Pokeball drop sequence, see startPokeballDrop
+local pendingHealBall = false -- true while waiting for script.ended after a heal
+local followerBootSpawn = false -- true for one spawn after a via=="boot" map.entered
 local hideFollowerEmote, npcHasActiveEmote -- forward-declared: defined near
 -- the emote helpers below, but despawnFollower (every map transition) and
 -- reskin (every step, to catch a follower going invisible on water) both
@@ -410,6 +415,10 @@ local function despawnFollower(mod)
   if followerNpcId then mod.world:removeNpc(followerNpcId) end
   followerNpcId, followerIndex, followerMapId = nil, nil, nil
   followerTrail, followerGoal = nil, nil
+  if pokeballAnim then
+    mod.world:removeNpc(pokeballAnim.npcId)
+    pokeballAnim = nil
+  end
   hideFollowerEmote(mod)
 end
 
@@ -429,9 +438,142 @@ local function spawnFollower(mod, mapId, cx, cy, facing)
   end
   h.npc.passable = true
   h.npc.facing = facing or "down"
+  -- -1 py so a same-cell overlap with the player always sorts behind them (World:drawPeople draws ascending py last-on-top)
+  h.npc.px, h.npc.py = cx * 16, cy * 16 - 1
   followerNpcId, followerIndex, followerMapId = npcId, index, mapId
   followerTrail = { x = cx, y = cy }
   followerGoal = nil
+end
+
+-- pokeball.png: 16x48 vertical sheet, top-to-bottom = opening/release/closed
+local POKEBALL_SPRITE = "OWM_POKEBALL_SLOT"
+local POKEBALL_FRAME_W, POKEBALL_FRAME_H, POKEBALL_FRAMES = 16, 16, 3
+local POKEBALL_FRAME_OPEN, POKEBALL_FRAME_RELEASE, POKEBALL_FRAME_CLOSED = 0, 1, 2
+local POKEBALL_DROP_SECONDS = 0.45
+local POKEBALL_OPEN_SECONDS = 0.22
+local POKEBALL_RELEASE_SECONDS = 0.22
+local POKEBALL_BOUNCE_PX = 10
+
+local FOLLOWER_BEHIND_DELTA = { -- opposite of facing, for the heal ball's drop cell
+  up = { 0, 1 }, down = { 0, -1 }, left = { 1, 0 }, right = { -1, 0 },
+}
+
+local function behindPlayerCell(world, p)
+  local delta = FOLLOWER_BEHIND_DELTA[p.facing]
+  local bx = p.cellX + (delta and delta[1] or 0)
+  local by = p.cellY + (delta and delta[2] or 0)
+  local map = world and world.map
+  if map and map.isWalkableCell and not map:isWalkableCell(bx, by) then
+    return p.cellX, p.cellY -- behind is a wall: fall back to the player's own cell
+  end
+  return bx, by
+end
+
+local BOOT_SPAWN_OFFSETS = { -- cardinal before diagonal, checked in order
+  { 0, 1 }, { 0, -1 }, { 1, 0 }, { -1, 0 },
+  { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 },
+}
+
+local function cellOccupied(world, cx, cy)
+  for _, npc in ipairs(world and world.npcs or {}) do
+    if npc.cellX == cx and npc.cellY == cy then return true end
+  end
+  return false
+end
+
+local function findFreeSpawnCell(world, p)
+  local map = world and world.map
+  for _, d in ipairs(BOOT_SPAWN_OFFSETS) do
+    local cx, cy = p.cellX + d[1], p.cellY + d[2]
+    if (not map or not map.isWalkableCell or map:isWalkableCell(cx, cy))
+        and not cellOccupied(world, cx, cy) then
+      return cx, cy
+    end
+  end
+  return p.cellX, p.cellY -- boxed in on every side: fall back to co-located
+end
+
+local function buildPokeballDef(mod)
+  if RUNTIME.pokeballDef ~= nil then return RUNTIME.pokeballDef or nil end
+  RUNTIME.pokeballDef = {
+    id = POKEBALL_SPRITE,
+    image = mod.path .. "/assets/vfx/pokeball.png",
+    frames = POKEBALL_FRAMES,
+    frameWidth = POKEBALL_FRAME_W,
+    frameHeight = POKEBALL_FRAME_H,
+    anchorX = POKEBALL_FRAME_W / 2,
+    anchorY = POKEBALL_FRAME_H,
+    walker = false,
+    spriteType = "STANDING_SPRITE",
+    trueColor = true,
+  }
+  return RUNTIME.pokeballDef
+end
+
+local function pokeballDropOffsetPx(u) -- ease-out fall through 65%, then one decaying bounce
+  if u < 0.65 then
+    local f = 1 - (u / 0.65)
+    return POKEBALL_BOUNCE_PX * f * f
+  end
+  local f = (u - 0.65) / 0.35
+  return POKEBALL_BOUNCE_PX * 0.3 * math.sin(math.pi * f)
+end
+
+local function startPokeballDrop(mod, mapId, cx, cy, facing) -- cx/cy is exactly where the follower should end up
+  if pokeballAnim or not (mapId and cx and cy) then return end
+  local def = buildPokeballDef(mod)
+  if not def then return end
+  local world = mod.game and mod.game.world
+  if world and world.sprites then world.sprites[POKEBALL_SPRITE] = def end
+  local npcId = mod.world:spawnNpc(mapId, {
+    sprite = POKEBALL_SPRITE, x = cx, y = cy,
+    movement = NPC_MOVE_STAND, radius = { x = 0, y = 0 },
+  })
+  if type(npcId) ~= "string" then return end
+  local index = tonumber(npcId:match("_obj_(%d+)$"))
+  local h = index and mod.world:npc(mapId, index)
+  if not (h and h.npc) then
+    mod.world:removeNpc(npcId)
+    return
+  end
+  h.npc.passable = true
+  h.npc.facing = "down"
+  pokeballAnim = {
+    mapId = mapId, npcId = npcId, index = index,
+    cx = cx, cy = cy, facing = facing or "down",
+    phase = "drop", clock = 0,
+  }
+end
+
+local function updatePokeballDrop(mod, dt)
+  if not pokeballAnim then return end
+  local a = pokeballAnim
+  local h = mod.world:npc(a.mapId, a.index)
+  if not (h and h.npc) then
+    pokeballAnim = nil
+    return
+  end
+  a.clock = a.clock + (dt or 0)
+
+  local frame, offsetPx = POKEBALL_FRAME_CLOSED, 0
+  if a.phase == "drop" then
+    local u = math.min(1, a.clock / POKEBALL_DROP_SECONDS)
+    offsetPx = pokeballDropOffsetPx(u)
+    if a.clock >= POKEBALL_DROP_SECONDS then a.phase, a.clock = "opening", 0 end
+  elseif a.phase == "opening" then
+    frame = POKEBALL_FRAME_OPEN
+    if a.clock >= POKEBALL_OPEN_SECONDS then a.phase, a.clock = "release", 0 end
+  elseif a.phase == "release" then
+    frame = POKEBALL_FRAME_RELEASE
+    if a.clock >= POKEBALL_RELEASE_SECONDS then
+      mod.world:removeNpc(a.npcId)
+      pokeballAnim = nil
+      spawnFollower(mod, a.mapId, a.cx, a.cy, a.facing)
+      return
+    end
+  end
+  h.npc.px, h.npc.py = a.cx * 16, a.cy * 16 - offsetPx
+  h.npc.bounceFrame = function() return frame end
 end
 
 local function setupFollower(mod)
@@ -485,6 +627,7 @@ local function setupFollower(mod)
   end
 
   local lastKey
+  local lastDex -- separate from lastKey: only a real species change should Pokeball
 
   local function reskin(game, world)
     local mon, rec = leadMon(mod, game, world)
@@ -492,26 +635,26 @@ local function setupFollower(mod)
     local npc = currentFollowerHandle(mod)
 
     if not dex then
-      lastKey = nil
+      lastKey, lastDex = nil, nil
       if npc then despawnFollower(mod) end
       return
     end
 
     if not npc then
-      -- Spawn directly on the player's own (fully settled) cell, exactly
-      -- like the native follower's own spawn fallback -- it overlaps for
-      -- one frame and trails out from under on the very next step. This
-      -- runs a tick after map.entered (see below), so by now the engine
-      -- has finished any in-flight warp/connection-crossing bookkeeping
-      -- and world.player reflects real, settled coordinates -- no need to
-      -- guess a "behind" cell from data that's still mid-transition.
+      if pokeballAnim or pendingHealBall then return end -- let a heal/lead-change ball finish first
       local mapId = world and world.map and world.map.id
       local p = world and world.player
       if p then
-        spawnFollower(mod, mapId, p.cellX, p.cellY, p.facing)
+        if followerBootSpawn then
+          followerBootSpawn = false
+          local cx, cy = findFreeSpawnCell(world, p)
+          spawnFollower(mod, mapId, cx, cy, p.facing)
+        else
+          spawnFollower(mod, mapId, p.cellX, p.cellY, p.facing)
+        end
       end
       npc = currentFollowerHandle(mod)
-      lastKey = nil
+      lastKey, lastDex = nil, nil
     end
     if not npc then return end
 
@@ -534,6 +677,15 @@ local function setupFollower(mod)
     local key = dex .. ":" .. terrain .. ":" .. (form or "") .. (shiny and ":S" or "")
 
     if key ~= lastKey then
+      if lastDex ~= nil and dex ~= lastDex then -- a real species change, not just terrain/shiny
+        if game.stack and game.stack:top() then return end -- wait for the party menu to close
+        local cx, cy, facing = npc.cellX, npc.cellY, npc.facing
+        local mapId = world and world.map and world.map.id
+        despawnFollower(mod)
+        lastKey, lastDex = nil, nil
+        startPokeballDrop(mod, mapId, cx, cy, facing)
+        return
+      end
       local def = defFor(dex, terrain, form, shiny)
       if world and world.sprites then
         world.sprites[FOLLOWER_SPRITE] = def
@@ -541,7 +693,7 @@ local function setupFollower(mod)
       if npc.setSpriteDef and npc:setSpriteDef(def) then
         if world.applySpritePalette then world:applySpritePalette(npc) end
       end
-      lastKey = key
+      lastKey, lastDex = key, dex
       mod.log:info("overworldmons: follower sheet -> dex %d (%s%s)%s", dex, terrain,
         form and (" " .. form) or "", shiny and " SHINY" or "")
     end
@@ -598,20 +750,11 @@ local function setupFollower(mod)
     npc.stepFrames = stepLen
   end
 
-  -- No respawn here: a seamless connection crossing fires this event with
-  -- the player still reporting the LANDING cell, one step ahead of where
-  -- they are actually about to animate in from (World:tryConnection
-  -- rewinds player position right after setMap returns, which is after
-  -- this event fires) -- spawning here read that not-yet-settled position
-  -- and put the follower a cell off, alternately landing on top of or
-  -- ahead of the player depending on the guess. Just clear the sprite key
-  -- and old NPC; reskin()'s own "no follower yet" fallback (above) spawns
-  -- fresh on the very next input.step tick, once world.player reflects
-  -- real, settled post-transition coordinates for every transition kind
-  -- (warp, door, or connection) alike.
-  mod.events:on("map.entered", function()
-    lastKey = nil
+  -- No respawn here: player position isn't settled until the next input.step tick, reskin() handles it
+  mod.events:on("map.entered", function(ev)
+    lastKey, lastDex = nil, nil
     despawnFollower(mod)
+    followerBootSpawn = (ev and ev.via == "boot") or false
   end)
 
   mod.events:on("map.exited", function() despawnFollower(mod) end)
@@ -623,9 +766,38 @@ local function setupFollower(mod)
       reskin(game, world)
       advanceMovement(world)
     end
+    updatePokeballDrop(mod, dt)
   end)
 
   mod.log:info("overworldmons: follower armed")
+end
+
+-- Despawns on HealParty, redrops the ball once the whole script ends (not just the heal)
+local function setupPokecenterFollowerHide(mod, Specials)
+  if not (Specials and Specials.ALL and Specials.ALL.HealParty) then
+    mod.log:info("overworldmons: no gen2 Specials.HealParty seam; follower "
+      .. "stays visible through Pokecenter heals")
+    return
+  end
+  local specials = Specials.ALL
+  if specials.__owmHealPartyHooked then return end
+  specials.__owmHealPartyHooked = true
+  local origHealParty = specials.HealParty
+  specials.HealParty = function(vm)
+    despawnFollower(mod)
+    pendingHealBall = true
+    if origHealParty then origHealParty(vm) end
+  end
+  mod.events:on("script.ended", function()
+    if not pendingHealBall then return end
+    pendingHealBall = false
+    local world = mod.game and mod.game.world
+    local p = world and world.player
+    if not p then return end
+    local cx, cy = behindPlayerCell(world, p)
+    startPokeballDrop(mod, world.map and world.map.id, cx, cy, p.facing)
+  end)
+  mod.log:info("overworldmons: follower armed for Pokecenter heal hide/reveal")
 end
 
 local EMOTE_FRAME_W, EMOTE_FRAME_H, EMOTE_FRAMES = 16, 16, 14
@@ -1295,6 +1467,57 @@ local OBJECT_OVERRIDES = {
     label = "Violet Speech House Pidgey (STRAWBERRY)" },
   { mapId = "MOUNT_MOON_SQUARE", index = 1, species = "CLEFAIRY",
     label = "Mt Moon Square Clefairy" },
+
+  -- Found by cross-checking every RESKIN-table sprite's map object against
+  -- the real "cry" op in its own talk script (data/generated/scripts.lua):
+  -- each of these borrows one of the RESKIN table's shared generic sprites
+  -- but its own script plays a *different* species' cry, so the blanket
+  -- reskin painted the wrong Pokemon in. (Excluded: Team Rocket Base B2F's
+  -- three SPRITE_VOLTORB objects, whose cry/loadwildmon both say ELECTRODE
+  -- -- that mismatch is the vanilla "spot the fake Voltorb" puzzle, not a
+  -- reuse accident, so it's left alone.)
+  { mapId = "BLACKTHORN_DRAGON_SPEECH_HOUSE", index = 2, species = "DRATINI",
+    label = "Blackthorn Dragon Speech House Dratini" },
+  { mapId = "CELADON_CITY", index = 2, species = "POLIWRATH",
+    label = "Celadon City Poliwrath" },
+  { mapId = "CELADON_MANSION_1F", index = 2, species = "MEOWTH",
+    label = "Celadon Mansion 1F Meowth" },
+  { mapId = "CELADON_MANSION_1F", index = 4, species = "NIDORAN_F",
+    label = "Celadon Mansion 1F Nidoran-F" },
+  { mapId = "CERULEAN_CITY", index = 3, species = "SLOWBRO",
+    label = "Cerulean City Slowbro" },
+  { mapId = "CERULEAN_TRADE_SPEECH_HOUSE", index = 3, species = "KANGASKHAN",
+    label = "Cerulean Trade Speech House Kangaskhan" },
+  { mapId = "CHARCOAL_KILN", index = 3, species = "FARFETCH_D",
+    label = "Charcoal Kiln Farfetch'd" },
+  { mapId = "COPYCATS_HOUSE_1F", index = 3, species = "BLISSEY",
+    label = "Copycat's House 1F Blissey" },
+  { mapId = "COPYCATS_HOUSE_2F", index = 2, species = "DODRIO",
+    label = "Copycat's House 2F Dodrio" },
+  { mapId = "GOLDENROD_DEPT_STORE_B1F", index = 8, species = "MACHOKE",
+    label = "Goldenrod Dept Store B1F Machoke" },
+  { mapId = "INDIGO_PLATEAU_POKECENTER_1F", index = 6, species = "ABRA",
+    label = "Indigo Plateau PokeCenter 1F Abra" },
+  { mapId = "MR_FUJIS_HOUSE", index = 3, species = "PSYDUCK",
+    label = "Mr Fuji's House Psyduck" },
+  { mapId = "MR_FUJIS_HOUSE", index = 4, species = "NIDORINO",
+    label = "Mr Fuji's House Nidorino" },
+  { mapId = "MR_FUJIS_HOUSE", index = 5, species = "PIDGEY",
+    label = "Mr Fuji's House Pidgey" },
+  { mapId = "NATIONAL_PARK", index = 7, species = "PERSIAN",
+    label = "National Park Persian" },
+  { mapId = "PEWTER_NIDORAN_SPEECH_HOUSE", index = 2, species = "NIDORAN_M",
+    label = "Pewter Nidoran Speech House Nidoran-M" },
+  { mapId = "POKEMON_FAN_CLUB", index = 6, species = "BAYLEEF",
+    label = "Pokemon Fan Club Bayleef" },
+  { mapId = "RADIO_TOWER_4F", index = 3, species = "MEOWTH",
+    label = "Radio Tower 4F Meowth" },
+  { mapId = "ROUTE_28_STEEL_WING_HOUSE", index = 2, species = "FEAROW",
+    label = "Route 28 Steel Wing House Fearow" },
+  { mapId = "VIRIDIAN_NICKNAME_SPEECH_HOUSE", index = 3, species = "SPEAROW",
+    label = "Viridian Speech House Spearow" },
+  { mapId = "VIRIDIAN_NICKNAME_SPEECH_HOUSE", index = 4, species = "RATTATA",
+    label = "Viridian Speech House Rattata" },
 }
 
 local function setupObjectOverrides(mod)
@@ -1460,8 +1683,20 @@ end
 -- for the same purpose. Registered as our own font page/charmap entry
 -- (rather than assuming the base ROM's font already has it) so it draws
 -- through the normal glyph pipeline anywhere Font.draw is called.
+--
+-- The code must sit well clear of $100-$3FF: that's exactly the block a
+-- translation's own extra font page claims for accented/extended Latin and
+-- kana glyphs (src/render/Font.lua's own comment: "a kana block at $100").
+-- $101 collided with a PT-BR page there -- pageFor() sorts pages by base
+-- descending and returns the first whose base <= code, so any accented
+-- code >= $101 (Ã, Á, ...) resolved to our 1-glyph shiny page instead of
+-- the translation's, and our page has no quad for that offset, so it drew
+-- nothing: NÃO -> "N O", RÁDIO -> "R DIO". Parking the code just under
+-- Font.TTF_BASE keeps it above every plausible tile-page base (translations
+-- top out nowhere near this high) while still staying below TTF_BASE so it
+-- is never mistaken for a TTF codepoint.
 local SHINY_GLYPH_SEQ = "<SHINY>"
-local SHINY_GLYPH_CODE = 0x101
+local SHINY_GLYPH_CODE = 0x3F0000
 
 local function setupWild(mod, Chain, Roamers)
   if not (mod.world and mod.world.effectiveEncounters and mod.world.spawnNpc) then
@@ -2805,9 +3040,19 @@ return function(mod)
       .. "wanderers skip swarm substitution")
   end
 
+  local okS, mod_s = pcall(require, "src.script.gen2.Specials")
+  if okS and type(mod_s) == "table" and mod_s.ALL then
+    Specials = mod_s
+  else
+    Specials = nil
+    mod.log:info("overworldmons: no src.script.gen2.Specials seam; follower "
+      .. "stays visible through Pokecenter heals")
+  end
+
   local Chain = setupChain(mod)
 
   setupFollower(mod)
+  setupPokecenterFollowerHide(mod, Specials)
   setupFollowerEmotes(mod)
   setupFollowerForaging(mod)
   setupFollowerInteraction(mod)
