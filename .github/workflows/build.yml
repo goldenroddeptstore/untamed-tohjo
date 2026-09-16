@@ -28,7 +28,7 @@ jobs:
           mkdir -p dist
           zip -X -r "dist/overworldmons-${{ steps.manifest.outputs.version }}.zip" \
             manifest.json main.lua assets \
-            -x "assets/mon/_prototype/*" "assets/mon/gray/*"
+            -x "assets/mon/_prototype/*" "assets/mon/gray/*" "assets/mon/palettes.json"
 
       - uses: actions/upload-artifact@v4
         with:

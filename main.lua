@@ -1,7 +1,8 @@
 
-local MAX_DEX = 251
+local MAX_DEX = 493
 local FALLBACK_DEX = 25
 local UNOWN_DEX = 201
+local CASTFORM_DEX = 351
 
 local Unown
 
@@ -13,12 +14,32 @@ local ZoomMod
 
 local Encounter
 
-local FollowerMod
-
 local function unownLetter(mon)
   if not (Unown and mon) then return nil end
   local idx = Unown.monLetter(mon)
   return idx and Unown.name(idx) or nil
+end
+
+-- We only ever READ a mon's current form here -- who decides/writes it (a
+-- spawn roll, a trigger event, a weather hook) is out of scope for this mod.
+-- No reader for a dex means we render its base/default sprite, same as any
+-- other species; mon._krCastformForm is Kanto-Reforged's own interop field
+-- (battle-scoped, usually nil in the overworld) -- read only, never written.
+-- KR names its weather suffixes sunny/rainy/snowy; the atlas keys Castform's
+-- forms sun/rain/cloud (no snow form exists in it) -- translate at the read.
+local CASTFORM_FORM_MAP = { sunny = "sun", rainy = "rain", snowy = "cloud" }
+
+local FORM_READERS = {
+  [UNOWN_DEX] = unownLetter,
+  [CASTFORM_DEX] = function(mon)
+    local suffix = mon and mon._krCastformForm
+    return suffix and CASTFORM_FORM_MAP[suffix] or nil
+  end,
+}
+
+local function formOf(dex, mon)
+  local reader = FORM_READERS[dex]
+  return reader and reader(mon) or nil
 end
 
 local function leadMon(mod, game, world)
@@ -35,6 +56,7 @@ end
 
 local CARD, FRAME_COUNT = 16, 6
 local RUNTIME_SHADES = { 0, 85, 170 }
+local RUNTIME_SHADES_85_170 = { 85, 170 }
 local RUNTIME = { pals = nil, warned = {} }
 
 local function hexToUnit(h)
@@ -107,32 +129,28 @@ local function decodeFlatJson(raw)
   return parseValue()
 end
 
-local function loadPalettes(mod)
-  if RUNTIME.pals ~= nil then return RUNTIME.pals or nil end
-  local pals = false
-  local okRead, raw = pcall(function() return mod:read("assets/mon/palettes.json") end)
+-- Combined manifest: assets/mon/atlas.json keys every (dex[, "_" form]) to a
+-- {frame={x,y,w,h}, normal={...}, shiny={...}, shades={...}} entry -- frame
+-- position and recolor palette live in one file (see tools/build_combined_atlas.py).
+local function loadManifest(mod)
+  if RUNTIME.manifest ~= nil then return RUNTIME.manifest or nil end
+  local manifest = false
+  local okRead, raw = pcall(function() return mod:read("assets/mon/atlas.json") end)
   if okRead and raw then
     local okDecode, decoded = pcall(decodeFlatJson, raw)
-    if okDecode and type(decoded) == "table" then pals = decoded end
+    if okDecode and type(decoded) == "table" then manifest = decoded end
   end
-  RUNTIME.pals = pals
-  return pals or nil
+  RUNTIME.manifest = manifest
+  return manifest or nil
 end
 
-local function loadAtlas(mod)
-  if RUNTIME.atlas ~= nil then return RUNTIME.atlas or nil, RUNTIME.atlasIndex end
-  local atlas, index = false, nil
-  local okIdx, raw = pcall(function() return mod:read("assets/mon/gray_atlas_index.json") end)
-  if okIdx and raw then
-    local okDecode, decoded = pcall(decodeFlatJson, raw)
-    if okDecode and type(decoded) == "table" then index = decoded end
-  end
-  if index then
-    local okImg, data = pcall(love.image.newImageData, mod.assets:path("assets/mon/gray_atlas.png"))
-    if okImg then atlas = data end
-  end
-  RUNTIME.atlas, RUNTIME.atlasIndex = atlas, index
-  return atlas or nil, index
+local function loadAtlasImage(mod)
+  if RUNTIME.atlas ~= nil then return RUNTIME.atlas or nil end
+  local atlas = false
+  local okImg, data = pcall(love.image.newImageData, mod.assets:path("assets/mon/atlas.png"))
+  if okImg then atlas = data end
+  RUNTIME.atlas = atlas
+  return atlas or nil
 end
 
 local function nearestShade(v255)
@@ -148,14 +166,14 @@ local function ribbonFoam(x, row)
   if row == 0 then return (x % 8) < 4 else return (x % 8) >= 4 end
 end
 
-local function buildRuntimeSheet(atlasData, atlasY0, lut, submerge)
+local function buildRuntimeSheet(atlasData, atlasX0, atlasY0, lut, submerge)
   local w, h = CARD, CARD * FRAME_COUNT
   local out = love.image.newImageData(w, h)
   for frame = 0, FRAME_COUNT - 1 do
     local y0 = frame * CARD
     for y = y0, y0 + CARD - 1 do
       for x = 0, CARD - 1 do
-        local r, _, _, a = atlasData:getPixel(x, atlasY0 + y)
+        local r, _, _, a = atlasData:getPixel(atlasX0 + x, atlasY0 + y)
         if a > 0 then
           local shade = nearestShade(math.floor(r * 255 + 0.5))
           local c = lut[shade]
@@ -190,26 +208,33 @@ end
 
 local function spriteDefFor(mod, idPrefix, dex, terrain, form, shiny)
   if not (love and love.image) then return nil end
-  local pals = loadPalettes(mod)
-  local entry = pals and pals[tostring(dex)]
-  if not entry then return nil end
-  local colors = (shiny and entry.shiny) or entry.normal
+  local manifest = loadManifest(mod)
+  if not manifest then return nil end
 
   local key = dex .. "_" .. terrain .. (form and ("_" .. form) or "")
     .. (shiny and "_S" or "")
   local ok, result = pcall(function()
-    local atlasData, index = loadAtlas(mod)
-    if not (atlasData and index) then error("gray_atlas.png / index unavailable") end
-    local atlasKey = (dex == UNOWN_DEX and form) and (dex .. "_" .. form) or tostring(dex)
-    local frameRow = index[atlasKey]
-    if not frameRow then error("no atlas entry for " .. atlasKey) end
-    local atlasY0 = frameRow * CARD
-    local lut = {}
-    for i, s in ipairs(entry.shades) do
-      local r, g, b = hexToUnit(colors[i])
-      lut[s] = { r, g, b }
+    local atlasData = loadAtlasImage(mod)
+    if not atlasData then error("atlas.png unavailable") end
+    local atlasKey = tostring(dex)
+    if form then
+      local suffixed = dex .. "_" .. form
+      if manifest[suffixed] then atlasKey = suffixed end
     end
-    return buildRuntimeSheet(atlasData, atlasY0, lut, terrain == "water")
+    local entry = manifest[atlasKey]
+    if not entry then error("no atlas entry for " .. atlasKey) end
+    local colors = (shiny and entry.shiny) or entry.normal
+    local frame = entry.frame
+    -- Shade 0 (outline) is always black and omitted from the manifest;
+    -- colors[1]/[2] are shade 85/170 (some species have no shade 170).
+    local lut = { [0] = { 0, 0, 0 } }
+    for i, shade in ipairs(RUNTIME_SHADES_85_170) do
+      if colors[i] then
+        local r, g, b = hexToUnit(colors[i])
+        lut[shade] = { r, g, b }
+      end
+    end
+    return buildRuntimeSheet(atlasData, frame[1], frame[2], lut, terrain == "water")
   end)
   if not ok then
     if not RUNTIME.warned[key] then
@@ -241,7 +266,7 @@ local function bootstrapDef(mod, id)
   }
 end
 
-local FOLLOWER_SPRITE = "SPRITE_PIKACHU"
+local FOLLOWER_SPRITE = "OWM_FOLLOWER_SLOT"
 
 local POOL = 24
 local RADIUS = { x = 4, y = 4 }
@@ -249,7 +274,6 @@ local WANDER, SWIM_WANDER = 2, 0x24
 
 local SPARKLE_FRAME_W, SPARKLE_FRAME_H, SPARKLE_FRAMES = 16, 24, 21
 local SPARKLE_FRAME_SECONDS = 0.12
-local SPARKLE_POOL = 8
 
 local function loadSparklePalette(mod)
   if RUNTIME.sparklePal ~= nil then return RUNTIME.sparklePal or nil end
@@ -263,11 +287,21 @@ local function loadSparklePalette(mod)
   return pal or nil
 end
 
-local function buildSparkleDef(mod)
-  if RUNTIME.sparkleDef ~= nil then return RUNTIME.sparkleDef or nil end
-  local def = false
+-- Same on-screen anchor SpriteRenderer.lua uses for every native standing
+-- sprite (references/gen1recomp/src/render/SpriteRenderer.lua: WORLD_ANCHOR_X/Y,
+-- getScreenOrigin) -- replicated here so the sparkle overlay lines up with a
+-- wanderer's own sprite exactly, rather than guessing an offset. Drawn as our
+-- own render.hud overlay (see setupWild's sparkle draw hook) instead of a
+-- companion NPC riding the Y-sorted people list, the same fix shape as
+-- showFollowerEmote's move to world.emote below: no second entity to spawn,
+-- despawn, or keep in sync every tick -- just read the host's live px/py.
+local WORLD_ANCHOR_X, WORLD_ANCHOR_Y = 8, 12
+
+local function buildSparkleFrames(mod)
+  if RUNTIME.sparkleFrames ~= nil then return RUNTIME.sparkleFrames or nil end
+  local frames = false
   local ok, result = pcall(function()
-    if not (love and love.image) then error("no love.image") end
+    if not (love and love.image and love.graphics) then error("no love.graphics") end
     local pal = loadSparklePalette(mod)
     if not pal then error("assets/vfx/palettes.json missing 'sparkle' entry") end
     local lut = {}
@@ -287,25 +321,20 @@ local function buildSparkleDef(mod)
         end
       end
     end
-    return {
-      id = "OWM_SPARKLE_SHEET",
-      image = out,
-      frames = SPARKLE_FRAMES,
-      frameWidth = SPARKLE_FRAME_W,
-      frameHeight = SPARKLE_FRAME_H,
-      anchorX = SPARKLE_FRAME_W / 2,
-      anchorY = SPARKLE_FRAME_H,
-      walker = false,
-      spriteType = "STANDING_SPRITE",
-      trueColor = true,
-    }
+    local image = love.graphics.newImage(out)
+    local quads = {}
+    for f = 0, SPARKLE_FRAMES - 1 do
+      quads[f] = love.graphics.newQuad(0, f * SPARKLE_FRAME_H,
+        SPARKLE_FRAME_W, SPARKLE_FRAME_H, image:getDimensions())
+    end
+    return { image = image, quads = quads }
   end)
-  if ok then def = result end
-  RUNTIME.sparkleDef = def
-  if not def then
-    mod.log:error("overworldmons: sparkle sprite build failed: " .. tostring(result))
+  if ok then frames = result end
+  RUNTIME.sparkleFrames = frames
+  if not frames then
+    mod.log:error("overworldmons: sparkle frame build failed: " .. tostring(result))
   end
-  return def or nil
+  return frames or nil
 end
 
 local MIN_SPAWN_DIST = 4
@@ -321,14 +350,52 @@ local STEP_THROTTLE = 2
 local DECAY_MIN_SECONDS = 20
 local DECAY_MAX_SECONDS = 35
 
-local function setupFollower(mod)
-  local ok, Follower = pcall(require, "src.world.PikachuFollower")
-  if not ok or type(Follower) ~= "table" or not Follower.setShouldSpawn then
-    mod.log:warn("overworldmons: no gen2 Follower.setShouldSpawn seam; follower off")
+-- gen2/Npc.lua MOVE.STANDING_DOWN: no autonomous wander, and (unlike MOVE.STILL)
+-- not in FIXED_FACING_MOVE, so scriptStep is still free to turn it to face
+-- whichever direction it steps. Chosen over requiring either engine's native
+-- follower module (src.world.PikachuFollower / src.world.gen2.Follower)
+-- directly: Gen 1's real module has no programmatic spawn-condition hook and
+-- is hard-wired to a party PIKACHU, so a from-scratch mod-owned NPC is what
+-- both generations will eventually share, not a Gen2-only convenience.
+local NPC_MOVE_STAND = 6
+
+local followerNpcId, followerIndex, followerMapId
+local followerTrail, followerGoal
+
+local function currentFollowerHandle(mod)
+  if not (followerMapId and followerIndex) then return nil end
+  local h = mod.world:npc(followerMapId, followerIndex)
+  return h and h.npc or nil
+end
+
+local function despawnFollower(mod)
+  if followerNpcId then mod.world:removeNpc(followerNpcId) end
+  followerNpcId, followerIndex, followerMapId = nil, nil, nil
+  followerTrail, followerGoal = nil, nil
+end
+
+local function spawnFollower(mod, mapId, cx, cy, facing)
+  despawnFollower(mod)
+  if not (mapId and cx and cy) then return end
+  local npcId = mod.world:spawnNpc(mapId, {
+    sprite = FOLLOWER_SPRITE, x = cx, y = cy,
+    movement = NPC_MOVE_STAND, radius = { x = 0, y = 0 },
+  })
+  if type(npcId) ~= "string" then return end
+  local index = tonumber(npcId:match("_obj_(%d+)$"))
+  local h = index and mod.world:npc(mapId, index)
+  if not (h and h.npc) then
+    mod.world:removeNpc(npcId)
     return
   end
-  FollowerMod = Follower
+  h.npc.passable = true
+  h.npc.facing = facing or "down"
+  followerNpcId, followerIndex, followerMapId = npcId, index, mapId
+  followerTrail = { x = cx, y = cy }
+  followerGoal = nil
+end
 
+local function setupFollower(mod)
   local defs = { land = {}, water = {} }
   local function defFor(dex, terrain, form, shiny)
     local cache = defs[terrain]
@@ -380,23 +447,40 @@ local function setupFollower(mod)
 
   local lastKey
 
-  Follower.setShouldSpawn(function(game, world)
+  local function reskin(game, world)
     local mon, rec = leadMon(mod, game, world)
     local dex = mon and (dexOfRec(rec) or FALLBACK_DEX) or nil
+    local npc = currentFollowerHandle(mod)
+
     if not dex then
       lastKey = nil
-      return false
+      if npc then despawnFollower(mod) end
+      return
     end
 
-    local npc = Follower.current and Follower.current(world)
+    if not npc then
+      -- Spawn directly on the player's own (fully settled) cell, exactly
+      -- like the native follower's own spawn fallback -- it overlaps for
+      -- one frame and trails out from under on the very next step. This
+      -- runs a tick after map.entered (see below), so by now the engine
+      -- has finished any in-flight warp/connection-crossing bookkeeping
+      -- and world.player reflects real, settled coordinates -- no need to
+      -- guess a "behind" cell from data that's still mid-transition.
+      local mapId = world and world.map and world.map.id
+      local p = world and world.player
+      if p then
+        spawnFollower(mod, mapId, p.cellX, p.cellY, p.facing)
+      end
+      npc = currentFollowerHandle(mod)
+      lastKey = nil
+    end
+    if not npc then return end
+
     local onWater = followerTerrain(world, npc) == "water"
     local swims = onWater and canSwim(mon, rec)
+    npc.hiddenByMovement = (onWater and not swims) or nil
 
-    if npc then
-      npc.hiddenByMovement = (onWater and not swims) or nil
-    end
-
-    local form = dex == UNOWN_DEX and unownLetter(mon) or nil
+    local form = formOf(dex, mon)
     local terrain = swims and "water" or "land"
     local shiny = Mon and mon.dvs
       and Mon.isShiny(mon.dvs, { species = mon.species, level = mon.level })
@@ -407,21 +491,96 @@ local function setupFollower(mod)
       if world and world.sprites then
         world.sprites[FOLLOWER_SPRITE] = def
       end
-      if npc and npc.setSpriteDef and npc:setSpriteDef(def) then
+      if npc.setSpriteDef and npc:setSpriteDef(def) then
         if world.applySpritePalette then world:applySpritePalette(npc) end
       end
       lastKey = key
       mod.log:info("overworldmons: follower sheet -> dex %d (%s%s)%s", dex, terrain,
         form and (" " .. form) or "", shiny and " SHINY" or "")
     end
+  end
 
-    return true
+  -- Ported from gen2/Follower.lua's own update(), which runs every frame off
+  -- the player's LIVE in-flight step (p.targetX/Y, set the instant a step is
+  -- committed) rather than a "step landed" event -- reacting only on
+  -- world.stepped (fires once the step completes) added a structural extra
+  -- delay every single step that compounded under continuous movement,
+  -- which is why the follower fell further and further behind instead of
+  -- holding a steady one-cell gap. Also missing before: matching the
+  -- follower's own stepFrames to the player's real step speed (so a faster
+  -- player, e.g. biking, doesn't leave it in the dust) and halving that
+  -- once more than one cell behind, exactly like the real "FastPikachuFollow"
+  -- catch-up the native modules use.
+  local function advanceMovement(world)
+    local npc = currentFollowerHandle(mod)
+    local p = world and world.player
+    if not (npc and p) then return end
+    if not followerTrail then followerTrail = { x = p.cellX, y = p.cellY } end
+    local trail = followerTrail
+    local destX, destY = p.targetX or p.cellX, p.targetY or p.cellY
+    if destX ~= trail.x or destY ~= trail.y then
+      followerGoal = { x = trail.x, y = trail.y }
+      trail.x, trail.y = destX, destY
+    end
+
+    if npc.moving or not followerGoal then return end
+    local gx, gy = followerGoal.x, followerGoal.y
+    if npc.cellX == gx and npc.cellY == gy then
+      followerGoal = nil
+      return
+    end
+
+    -- more than a screen behind (a warp, a scripted move): snap, don't walk
+    local far = math.abs(npc.cellX - gx) + math.abs(npc.cellY - gy)
+    if far > 6 then
+      npc.cellX, npc.cellY = gx, gy
+      npc.px, npc.py = gx * 16, gy * 16
+      followerGoal = nil
+      return
+    end
+
+    local dir
+    if npc.cellX < gx then dir = "right"
+    elseif npc.cellX > gx then dir = "left"
+    elseif npc.cellY < gy then dir = "down"
+    else dir = "up" end
+    if not (dir and npc.scriptStep) then return end
+    npc:scriptStep(dir)
+    local stepLen = p.stepFrames or 16
+    if far > 1 then stepLen = math.max(1, math.floor(stepLen / 2)) end
+    npc.stepFrames = stepLen
+  end
+
+  -- No respawn here: a seamless connection crossing fires this event with
+  -- the player still reporting the LANDING cell, one step ahead of where
+  -- they are actually about to animate in from (World:tryConnection
+  -- rewinds player position right after setMap returns, which is after
+  -- this event fires) -- spawning here read that not-yet-settled position
+  -- and put the follower a cell off, alternately landing on top of or
+  -- ahead of the player depending on the guess. Just clear the sprite key
+  -- and old NPC; reskin()'s own "no follower yet" fallback (above) spawns
+  -- fresh on the very next input.step tick, once world.player reflects
+  -- real, settled post-transition coordinates for every transition kind
+  -- (warp, door, or connection) alike.
+  mod.events:on("map.entered", function()
+    lastKey = nil
+    despawnFollower(mod)
+  end)
+
+  mod.events:on("map.exited", function() despawnFollower(mod) end)
+
+  mod.hooks:wrap("input.step", function(next_, game, dt)
+    next_(game, dt)
+    local world = mod.game and mod.game.world
+    if world then
+      reskin(game, world)
+      advanceMovement(world)
+    end
   end)
 
   mod.log:info("overworldmons: follower armed")
 end
 
-local EMOTE_SPRITE = "OWM_FOLLOWER_EMOTE"
 local EMOTE_FRAME_W, EMOTE_FRAME_H, EMOTE_FRAMES = 16, 16, 14
 local EMOTE_DEFAULT_HOLD = 1.5
 
@@ -431,76 +590,55 @@ local EMOTE = {
   CROWN = 12, ZZZ = 13,
 }
 
-local emoteState = {
-  npcId = nil, index = nil, mapId = nil, frame = nil,
-  clock = 0, hold = 0, persistent = false,
-}
+local emoteFrameCache = {}
+local ownEmote = nil -- the table we last assigned to world.emote, for identity checks
+local emotePersistent = false
 
-local function buildEmoteDef(mod)
-  if RUNTIME.emoteDef ~= nil then return RUNTIME.emoteDef or nil end
-  local def = {
-    id = EMOTE_SPRITE, image = mod.path .. "/assets/vfx/emotes.png",
-    frames = EMOTE_FRAMES, frameWidth = EMOTE_FRAME_W, frameHeight = EMOTE_FRAME_H,
-    walker = false, spriteType = "STANDING_SPRITE", trueColor = true,
-  }
-  RUNTIME.emoteDef = def
-  return def
+local function emoteFrameImage(mod, index)
+  if emoteFrameCache[index] ~= nil then return emoteFrameCache[index] or nil end
+  local ok, result = pcall(function()
+    if not (love and love.image and love.graphics) then error("no love.graphics") end
+    local src = love.image.newImageData(mod.assets:path("assets/vfx/emotes.png"))
+    local out = love.image.newImageData(EMOTE_FRAME_W, EMOTE_FRAME_H)
+    out:paste(src, 0, 0, 0, index * EMOTE_FRAME_H, EMOTE_FRAME_W, EMOTE_FRAME_H)
+    return love.graphics.newImage(out)
+  end)
+  if not ok then
+    mod.log:error("overworldmons: emote frame %d build failed: %s", index, tostring(result))
+    emoteFrameCache[index] = false
+    return nil
+  end
+  emoteFrameCache[index] = result
+  return result
 end
 
 local function hideFollowerEmote(mod)
-  if emoteState.npcId and mod.world and mod.world.removeNpc then
-    mod.world:removeNpc(emoteState.npcId)
-  end
-  emoteState.npcId, emoteState.index, emoteState.mapId, emoteState.frame = nil, nil, nil, nil
-  emoteState.clock, emoteState.hold, emoteState.persistent = 0, 0, false
+  local world = mod.game and mod.game.world
+  if world and world.emote == ownEmote then world.emote = nil end
+  ownEmote, emotePersistent = nil, false
 end
 
 local function showFollowerEmote(mod, world, followerNpc, frameIndex, opts)
-  if not (world and world.map and followerNpc) then return end
+  if not (world and followerNpc) then return end
   opts = opts or {}
-  hideFollowerEmote(mod)
-  local def = buildEmoteDef(mod)
-  if not def then return end
-  local mapId = world.map.id
-  if world.sprites then world.sprites[EMOTE_SPRITE] = def end
-  local npcId = mod.world:spawnNpc(mapId, {
-    sprite = EMOTE_SPRITE, x = followerNpc.cellX, y = followerNpc.cellY,
-    movement = 6, radius = { x = 0, y = 0 },
-  })
-  if type(npcId) ~= "string" then return end
-  local index = tonumber(npcId:match("_obj_(%d+)$"))
-  local h = index and mod.world:npc(mapId, index)
-  if not (h and h.npc) then
-    mod.world:removeNpc(npcId)
-    return
-  end
-  h.npc.passable = true
-  h.npc.px, h.npc.py = followerNpc.px, followerNpc.py - EMOTE_FRAME_H
-  h.npc.bounceFrame = function() return frameIndex end
-  if world.applySpritePalette then world:applySpritePalette(h.npc) end
-  emoteState.npcId, emoteState.index, emoteState.mapId, emoteState.frame =
-    npcId, index, mapId, frameIndex
-  emoteState.hold = opts.holdSeconds or EMOTE_DEFAULT_HOLD
-  emoteState.clock = 0
-  emoteState.persistent = opts.persistent and true or false
+  local image = emoteFrameImage(mod, frameIndex)
+  if not image then return end
+  ownEmote = { image = image, entity = followerNpc,
+    left = math.floor((opts.holdSeconds or EMOTE_DEFAULT_HOLD) * 60 + 0.5) }
+  world.emote = ownEmote
+  emotePersistent = opts.persistent and true or false
 end
 
 local function setupFollowerEmotes(mod)
   mod.hooks:wrap("input.step", function(next_, game, dt)
     next_(game, dt)
-    if not emoteState.npcId then return end
+    if not (emotePersistent and ownEmote) then return end
     local world = mod.game and mod.game.world
-    local npc = FollowerMod and world and FollowerMod.current(world)
-    local h = emoteState.index and mod.world:npc(emoteState.mapId, emoteState.index)
-    if not (npc and h and h.npc) then
-      hideFollowerEmote(mod)
-      return
+    if world and world.emote == ownEmote then
+      world.emote.left = 120
+    else
+      ownEmote, emotePersistent = nil, false
     end
-    h.npc.px, h.npc.py = npc.px, npc.py - EMOTE_FRAME_H
-    h.npc.bounceFrame = function() return emoteState.frame end
-    if emoteState.persistent then return end
-    emoteState.clock = emoteState.clock + (dt or 0)
-    if emoteState.clock >= emoteState.hold then hideFollowerEmote(mod) end
   end)
 end
 
@@ -646,7 +784,7 @@ local function rollForage(mod, world, mon)
   end
 
   forageState.ready, forageState.rare, forageState.itemName = true, rare, itemName
-  local npc = FollowerMod and FollowerMod.current(world)
+  local npc = currentFollowerHandle(mod)
   if npc then
     showFollowerEmote(mod, world, npc, rare and EMOTE.CROWN or EMOTE.EXCLAIM,
       { persistent = true })
@@ -841,10 +979,10 @@ end
 
 local function setupFollowerInteraction(mod)
   mod.events:on("world.interacted", function(ev)
-    if not (FollowerMod and ev) then return end
+    if not ev then return end
     local world = mod.game and mod.game.world
     if not world then return end
-    local npc = FollowerMod.current(world)
+    local npc = currentFollowerHandle(mod)
     if not (npc and npc.cellX == ev.x and npc.cellY == ev.y) then return end
     mod.log:info(
       "overworldmons: world.interacted at follower cell (%s,%s) kind=%s",
@@ -1175,18 +1313,133 @@ local function setupReskinBounceFix(mod)
   end)
 end
 
+-- World.lua's SPRITE.DAY_CARE_MON_1/2 (src/world/gen2/World.lua:176-177) --
+-- the two reserved sprite ids above the normal SPRITE.VARS range that the
+-- man/lady yard objects carry in their own map-object def (obj.sprite), on
+-- whichever map they're placed. Native resolveSprite only ever pools the
+-- object once a mon is actually deposited (an empty slot answers nil and
+-- pooledNpc spawns nothing), so scanning world.npcs for these two raw ids is
+-- exactly "is a bred mon currently standing in the yard" with no need to
+-- know the map or object index ourselves.
+local DAY_CARE_MON_1, DAY_CARE_MON_2 = 0xe0, 0xe1
+local DAYCARE_MAN_SPRITE, DAYCARE_LADY_SPRITE = "OWM_DAYCARE_MAN", "OWM_DAYCARE_LADY"
+
+local function setupDaycareReskin(mod)
+  if not (love and love.image) then
+    mod.log:warn("overworldmons: no love.image; day-care mon reskin off")
+    return
+  end
+  if not (mod.content and mod.content.pokemon and mod.content.sprites) then
+    mod.log:warn("overworldmons: no mod.content seam; day-care mon reskin off")
+    return
+  end
+
+  do
+    local ok, err = pcall(function()
+      mod.content.sprites:patch(DAYCARE_MAN_SPRITE, bootstrapDef(mod, DAYCARE_MAN_SPRITE))
+      mod.content.sprites:patch(DAYCARE_LADY_SPRITE, bootstrapDef(mod, DAYCARE_LADY_SPRITE))
+    end)
+    if not ok then
+      mod.log:error("overworldmons: day-care sprite registration failed: " .. tostring(err))
+      return
+    end
+  end
+
+  local defs = {}
+  local function defFor(dex, shiny)
+    local key = dex .. (shiny and "S" or "")
+    if defs[key] == nil then
+      defs[key] = spriteDefFor(mod, "OWM_DAYCARE_", dex, "land", nil, shiny) or false
+    end
+    return defs[key] or nil
+  end
+
+  -- Native icon def carries no `.dvs`, so shininess is read straight off the
+  -- deposited party-mon record (save.dayCare.man/lady.mon) the same way
+  -- resolveSprite reaches it, rather than trying to smuggle it through
+  -- World:breedmonSpriteDef's species-only signature.
+  local function reskinSlot(world, npc, which)
+    local save = mod.game and mod.game.save
+    local dc = save and save.dayCare
+    local slot = dc and dc[which]
+    local mon = slot and slot.mon
+    if not (mon and mon.species) then return end
+    local rec = mod.content.pokemon:get(mon.species)
+    local dex = rec and rec.dex
+    if not (type(dex) == "number" and dex >= 1 and dex <= MAX_DEX) then return end
+    local shiny = Mon and mon.dvs
+      and Mon.isShiny(mon.dvs, { species = mon.species, level = mon.level })
+    local def = defFor(dex, shiny)
+    if not def then return end
+    if npc.setSpriteDef and npc:setSpriteDef(def) then
+      if world.applySpritePalette then world:applySpritePalette(npc) end
+    end
+    -- The native yard object's own movement is MOVE.POKEMON (a two-frame
+    -- hop/flip in place -- NPC:bounceFrame overrides the normal walk-cycle
+    -- frame whenever `bouncing` is set, engine/overworld/map_object_action.asm
+    -- OBJECT_ACTION_BOUNCE), which setSpriteDef never touches. Left alone the
+    -- walking sheet plays under that bounce override and just flips between
+    -- two of its frames instead of animating -- same fix setupReskinBounceFix
+    -- applies to the other per-object reskins, done here every tick (not just
+    -- on map.entered) since this object's def can change mid-visit.
+    npc.bouncing = false
+  end
+
+  mod.hooks:wrap("input.step", function(next_, game, dt)
+    next_(game, dt)
+    local world = game and game.world
+    if not (world and world.npcs) then return end
+    for _, npc in ipairs(world.npcs) do
+      local s = npc.def and npc.def.sprite
+      if s == DAY_CARE_MON_1 or s == DAY_CARE_MON_2 then
+        reskinSlot(world, npc, s == DAY_CARE_MON_1 and "man" or "lady")
+      end
+    end
+  end)
+
+  mod.log:info("overworldmons: day-care mon reskin armed")
+end
+
 local function setupWild(mod, Chain, Roamers)
   if not (mod.world and mod.world.effectiveEncounters and mod.world.spawnNpc) then
     mod.log:warn("overworldmons: no gen2 mod.world spawn surface; wild off")
     return
   end
 
+  -- A content mod that ships its own small encounters.* subset (e.g. Kanto-
+  -- Reforged's restored-dungeon maps) can create data.encounters before we
+  -- run, which used to make us skip aliasing gen2Encounters in altogether --
+  -- every ordinary route then read as "no grass/water encounter table" and
+  -- spawned nothing. Back-fill per [kind][mapId] slot instead of gating on
+  -- "encounters == nil": anything already present (ours or another mod's) is
+  -- left alone, only genuinely missing map ids get the vanilla table.
+  -- Only "grass"/"water" -- the two kinds WorldAPI:effectiveEncounters reads
+  -- (src/world/gen2/WorldAPI.lua ENCOUNTER_TERRAIN) -- gen2Encounters' other
+  -- top-level keys (bugContest, trees, roamMons, source, ...) are differently
+  -- shaped (arrays/strings, not [mapId] dicts) and not ours to merge.
+  local ENCOUNTER_KINDS = { "grass", "water" }
+  local encounterAliasDone = false
   local function ensureEncounterAlias()
+    if encounterAliasDone then return end
     local gdata = mod.game and mod.game.data
-    if gdata and gdata.encounters == nil and gdata.gen2Encounters ~= nil then
-      gdata.encounters = gdata.gen2Encounters
-      mod.log:info("overworldmons: aliased data.encounters <- data.gen2Encounters")
+    local gen2 = gdata and gdata.gen2Encounters
+    if not gen2 then return end
+    encounterAliasDone = true
+    gdata.encounters = gdata.encounters or {}
+    local filled = 0
+    for _, kind in ipairs(ENCOUNTER_KINDS) do
+      local maps = gen2[kind]
+      if type(maps) == "table" then
+        gdata.encounters[kind] = gdata.encounters[kind] or {}
+        for mapId, tbl in pairs(maps) do
+          if gdata.encounters[kind][mapId] == nil then
+            gdata.encounters[kind][mapId] = tbl
+            filled = filled + 1
+          end
+        end
+      end
     end
+    mod.log:info("overworldmons: backfilled %d data.encounters[kind][mapId] slots from gen2Encounters", filled)
   end
   ensureEncounterAlias()
 
@@ -1200,14 +1453,10 @@ local function setupWild(mod, Chain, Roamers)
     return cache[key]
   end
   local function spriteId(slot) return "OWM_WILD_" .. slot end
-  local function sparkleSpriteId(slot) return "OWM_SPARKLE_" .. slot end
 
   local ok, err = pcall(function()
     for slot = 1, POOL do
       mod.content.sprites:patch(spriteId(slot), bootstrapDef(mod, spriteId(slot)))
-    end
-    for slot = 1, SPARKLE_POOL do
-      mod.content.sprites:patch(sparkleSpriteId(slot), bootstrapDef(mod, sparkleSpriteId(slot)))
     end
   end)
   if not ok then
@@ -1596,21 +1845,9 @@ local function setupWild(mod, Chain, Roamers)
     return nil
   end
 
-  local function sparkleSlotInUse()
-    local u = {}
-    for _, w in ipairs(live) do if w.sparkleSlot then u[w.sparkleSlot] = true end end
-    return u
-  end
-  local function freeSparkleSlot()
-    local u = sparkleSlotInUse()
-    for s = 1, SPARKLE_POOL do if not u[s] then return s end end
-    return nil
-  end
-
   local function removeWanderer(i)
     local w = live[i]
     if w and w.npcId then mod.world:removeNpc(w.npcId) end
-    if w and w.sparkleNpcId then mod.world:removeNpc(w.sparkleNpcId) end
     if w and w.npcId then liveById[w.npcId] = nil end
     table.remove(live, i)
   end
@@ -1688,27 +1925,7 @@ local function setupWild(mod, Chain, Roamers)
     liveById[npcId] = entry
     if shiny then
       mod.log:info("overworldmons: SHINY wild %s spawned on %s", species, mapId)
-      local sSlot = freeSparkleSlot()
-      local sDef = sSlot and buildSparkleDef(mod)
-      if sSlot and sDef then
-        local sSid = sparkleSpriteId(sSlot)
-        if world and world.sprites then world.sprites[sSid] = sDef end
-        local sNpcId = mod.world:spawnNpc(mapId, {
-          sprite = sSid, x = cell[1], y = cell[2],
-          movement = 6, radius = { x = 0, y = 0 },
-        })
-        if type(sNpcId) == "string" then
-          local sIndex = tonumber(sNpcId:match("_obj_(%d+)$"))
-          local sh = sIndex and mod.world:npc(mapId, sIndex)
-          if sh and sh.npc then
-            sh.npc.passable = true -- visual overlay riding the host's cell, never solid
-            if world and world.applySpritePalette then world:applySpritePalette(sh.npc) end
-          end
-          entry.sparkleNpcId, entry.sparkleIndex, entry.sparkleSlot =
-            sNpcId, sIndex, sSlot
-          entry.sparkleClock = 0
-        end
-      end
+      if buildSparkleFrames(mod) then entry.sparkleClock = 0 end
     end
   end
 
@@ -2145,19 +2362,10 @@ local function setupWild(mod, Chain, Roamers)
     end
 
     if activeMapId then
+      local period = SPARKLE_FRAME_SECONDS * SPARKLE_FRAMES
       for _, w in ipairs(live) do
-        if w.sparkleIndex then
-          local h = mod.world:npc(activeMapId, w.index)
-          local sh = mod.world:npc(activeMapId, w.sparkleIndex)
-          if h and h.npc and sh and sh.npc then
-            sh.npc.cellX, sh.npc.cellY = h.npc.cellX, h.npc.cellY
-            sh.npc.px, sh.npc.py = h.npc.px, h.npc.py
-            w.sparkleClock = (w.sparkleClock or 0) + (dt or 0)
-            local period = SPARKLE_FRAME_SECONDS * SPARKLE_FRAMES
-            w.sparkleClock = w.sparkleClock % period
-            local frame = math.floor(w.sparkleClock / SPARKLE_FRAME_SECONDS) % SPARKLE_FRAMES
-            sh.npc.bounceFrame = function() return frame end
-          end
+        if w.sparkleClock then
+          w.sparkleClock = (w.sparkleClock + (dt or 0)) % period
         end
       end
     end
@@ -2198,6 +2406,46 @@ local function setupWild(mod, Chain, Roamers)
     mod.world:queueScript({
       { "start_battle", "wild", battle.species, battle.level },
     })
+  end)
+
+  -- Shiny sparkle overlay: drawn directly over the host wanderer's own live
+  -- px/py every frame, the same fix shape as showFollowerEmote's move to
+  -- world.emote -- no companion NPC to spawn/despawn/keep in sync, so it can
+  -- never lag or settle a frame behind its host the way the old synced twin
+  -- did. Screen position replicates SpriteRenderer:getScreenOrigin's own
+  -- anchor math exactly (WORLD_ANCHOR_X/Y, bottom-anchored frame) so the
+  -- sparkle lines up on the same foot line the mon's own sprite draws from,
+  -- rather than guessing a fixed pixel offset.
+  mod.hooks:wrap("render.hud", function(next_, game, viewport)
+    next_(game, viewport)
+    if not activeMapId then return end
+    local frames = buildSparkleFrames(mod)
+    if not (frames and viewport) then return end
+    local world = mod.game and mod.game.world
+    local cam = world and world.camera
+    if not cam then return end
+    local G = love.graphics
+    local s = viewport.scale or 1
+    G.setColor(1, 1, 1, 1)
+    for _, w in ipairs(live) do
+      if w.sparkleClock and w.index then
+        local h = mod.world:npc(activeMapId, w.index)
+        local npc = h and h.npc
+        if npc then
+          local frame = math.floor(w.sparkleClock / SPARKLE_FRAME_SECONDS) % SPARKLE_FRAMES
+          local quad = frames.quads[frame]
+          if quad then
+            local baseX = math.floor(npc.px - cam.x) + WORLD_ANCHOR_X
+            local baseY = math.floor(npc.py - cam.y) + WORLD_ANCHOR_Y
+            local originX = baseX - SPARKLE_FRAME_W / 2
+            local originY = baseY - SPARKLE_FRAME_H
+            local sx = (viewport.gameX or 0) + originX * s
+            local sy = (viewport.gameY or 0) + originY * s
+            G.draw(frames.image, quad, sx, sy, 0, s, s)
+          end
+        end
+      end
+    end
   end)
 
   mod.events:on("battle.started", function(ev)
@@ -2348,4 +2596,5 @@ return function(mod)
   setupOverworldReskin(mod)
   setupObjectOverrides(mod)
   setupReskinBounceFix(mod)
+  setupDaycareReskin(mod)
 end
