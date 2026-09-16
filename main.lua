@@ -271,6 +271,7 @@ local FOLLOWER_SPRITE = "OWM_FOLLOWER_SLOT"
 local POOL = 24
 local RADIUS = { x = 4, y = 4 }
 local WANDER, SWIM_WANDER = 2, 0x24
+local MAX_LIVE_SHINIES = 3
 
 local SPARKLE_FRAME_W, SPARKLE_FRAME_H, SPARKLE_FRAMES = 16, 24, 21
 local SPARKLE_FRAME_SECONDS = 0.12
@@ -287,21 +288,23 @@ local function loadSparklePalette(mod)
   return pal or nil
 end
 
--- Same on-screen anchor SpriteRenderer.lua uses for every native standing
--- sprite (references/gen1recomp/src/render/SpriteRenderer.lua: WORLD_ANCHOR_X/Y,
--- getScreenOrigin) -- replicated here so the sparkle overlay lines up with a
--- wanderer's own sprite exactly, rather than guessing an offset. Drawn as our
--- own render.hud overlay (see setupWild's sparkle draw hook) instead of a
--- companion NPC riding the Y-sorted people list, the same fix shape as
--- showFollowerEmote's move to world.emote below: no second entity to spawn,
--- despawn, or keep in sync every tick -- just read the host's live px/py.
-local WORLD_ANCHOR_X, WORLD_ANCHOR_Y = 8, 12
+local SPARKLE_POOL = 8
 
-local function buildSparkleFrames(mod)
-  if RUNTIME.sparkleFrames ~= nil then return RUNTIME.sparkleFrames or nil end
-  local frames = false
+-- A real companion NPC riding the host wanderer's cell (movement=6/stay,
+-- passable, radius 0x0), not a hand-drawn render.hud overlay: the overlay
+-- version's own screen math (camera-relative px/py * viewport.scale) skipped
+-- World:zoomScale()'s survey-zoom offset, which native NPC drawing applies --
+-- correct at the default 1:1 zoom but dramatically offset at any other zoom
+-- level, and it kept drawing over the battle screen since render.hud has no
+-- "are we in battle" gate. Riding a real NPC sidesteps both: the engine's own
+-- getScreenOrigin/anchorX/anchorY positions it exactly like every other
+-- sprite, and it disappears with the rest of the world NPCs once battle
+-- starts.
+local function buildSparkleDef(mod)
+  if RUNTIME.sparkleDef ~= nil then return RUNTIME.sparkleDef or nil end
+  local def = false
   local ok, result = pcall(function()
-    if not (love and love.image and love.graphics) then error("no love.graphics") end
+    if not (love and love.image) then error("no love.image") end
     local pal = loadSparklePalette(mod)
     if not pal then error("assets/vfx/palettes.json missing 'sparkle' entry") end
     local lut = {}
@@ -321,20 +324,25 @@ local function buildSparkleFrames(mod)
         end
       end
     end
-    local image = love.graphics.newImage(out)
-    local quads = {}
-    for f = 0, SPARKLE_FRAMES - 1 do
-      quads[f] = love.graphics.newQuad(0, f * SPARKLE_FRAME_H,
-        SPARKLE_FRAME_W, SPARKLE_FRAME_H, image:getDimensions())
-    end
-    return { image = image, quads = quads }
+    return {
+      id = "OWM_SPARKLE_SHEET",
+      image = out,
+      frames = SPARKLE_FRAMES,
+      frameWidth = SPARKLE_FRAME_W,
+      frameHeight = SPARKLE_FRAME_H,
+      anchorX = SPARKLE_FRAME_W / 2,
+      anchorY = SPARKLE_FRAME_H,
+      walker = false,
+      spriteType = "STANDING_SPRITE",
+      trueColor = true,
+    }
   end)
-  if ok then frames = result end
-  RUNTIME.sparkleFrames = frames
-  if not frames then
-    mod.log:error("overworldmons: sparkle frame build failed: " .. tostring(result))
+  if ok then def = result end
+  RUNTIME.sparkleDef = def
+  if not def then
+    mod.log:error("overworldmons: sparkle sprite build failed: " .. tostring(result))
   end
-  return frames or nil
+  return def or nil
 end
 
 local MIN_SPAWN_DIST = 4
@@ -346,6 +354,32 @@ local VIEW_BUFFER = 4
 local DESPAWN_SLACK = 6
 local MIN_WANDERER_SPACING = 3
 local STEP_THROTTLE = 2
+
+-- BUGS.md item 17: a start-menu key item ("INCENSE") opening a submenu that
+-- cycles the wanderer density. OFF turns our own wanderer spawning off
+-- (roamers included) and lets the map's real encounter.roll proceed
+-- uninterrupted, i.e. plain vanilla. REPEL does the same for ordinary
+-- wanderers but leaves the roamer sync running (real Repel doesn't stop a
+-- Gen 2 roamer either), and additionally stamps save.repelSteps with a
+-- sentinel far past anything a real Repel ever reaches, so the engine's own
+-- native repel gate (World:repelSuppresses) blocks every ordinary encounter
+-- the same way a real one would, without us having to reimplement that gate
+-- ourselves.
+local INCENSE_KEY = "incenseMode"
+local INCENSE_SCREEN = "OverworldmonsIncense"
+local INCENSE_ORDER = { "off", "low", "medium", "high", "repel" }
+local INCENSE_SHORT_LABEL = {
+  off = "OFF", low = "LOW", medium = "MEDIUM", high = "HIGH", repel = "REPEL",
+}
+local INCENSE_DESC = {
+  off = "No Pokemon on the overworld.",
+  low = "Fewer Pokemon appear.",
+  medium = "A normal amount of Pokemon.",
+  high = "Lots of Pokemon appear.",
+  repel = "Only Roamers appear now.",
+}
+local INCENSE_DENSITY = { low = 0.3, medium = 0.6, high = 1.0 }
+local INCENSE_REPEL_STEPS = 999999
 
 local DECAY_MIN_SECONDS = 20
 local DECAY_MAX_SECONDS = 35
@@ -361,6 +395,10 @@ local NPC_MOVE_STAND = 6
 
 local followerNpcId, followerIndex, followerMapId
 local followerTrail, followerGoal
+local hideFollowerEmote, npcHasActiveEmote -- forward-declared: defined near
+-- the emote helpers below, but despawnFollower (every map transition) and
+-- reskin (every step, to catch a follower going invisible on water) both
+-- need to reach them before that point in the file.
 
 local function currentFollowerHandle(mod)
   if not (followerMapId and followerIndex) then return nil end
@@ -372,6 +410,7 @@ local function despawnFollower(mod)
   if followerNpcId then mod.world:removeNpc(followerNpcId) end
   followerNpcId, followerIndex, followerMapId = nil, nil, nil
   followerTrail, followerGoal = nil, nil
+  hideFollowerEmote(mod)
 end
 
 local function spawnFollower(mod, mapId, cx, cy, facing)
@@ -479,6 +518,14 @@ local function setupFollower(mod)
     local onWater = followerTerrain(world, npc) == "water"
     local swims = onWater and canSwim(mon, rec)
     npc.hiddenByMovement = (onWater and not swims) or nil
+    -- Once the follower goes invisible (surfing on a non-water/non-Surf
+    -- lead), it must stop being interactable too -- forage/interaction
+    -- triggers are already gated on hiddenByMovement above/below, but a
+    -- bubble rolled just before entering the water would otherwise keep
+    -- floating over nothing, which is the "spawns at the origin" report.
+    if npc.hiddenByMovement and npcHasActiveEmote(npc) then
+      hideFollowerEmote(mod)
+    end
 
     local form = formOf(dex, mon)
     local terrain = swims and "water" or "land"
@@ -612,10 +659,14 @@ local function emoteFrameImage(mod, index)
   return result
 end
 
-local function hideFollowerEmote(mod)
+function hideFollowerEmote(mod)
   local world = mod.game and mod.game.world
   if world and world.emote == ownEmote then world.emote = nil end
   ownEmote, emotePersistent = nil, false
+end
+
+function npcHasActiveEmote(npc)
+  return ownEmote ~= nil and ownEmote.entity == npc
 end
 
 local function showFollowerEmote(mod, world, followerNpc, frameIndex, opts)
@@ -799,6 +850,8 @@ local function setupFollowerForaging(mod)
     local world = mod.game and mod.game.world
     local mon = leadMon(mod, mod.game, world)
     if not mon then return end
+    local npc = currentFollowerHandle(mod)
+    if npc and npc.hiddenByMovement then return end
     local steps = mod.save:get(FORAGE_STEPS_KEY, 0) + 1
     if steps < FORAGE_STEP_INTERVAL then
       mod.save:set(FORAGE_STEPS_KEY, steps)
@@ -984,6 +1037,7 @@ local function setupFollowerInteraction(mod)
     if not world then return end
     local npc = currentFollowerHandle(mod)
     if not (npc and npc.cellX == ev.x and npc.cellY == ev.y) then return end
+    if npc.hiddenByMovement then return end
     mod.log:info(
       "overworldmons: world.interacted at follower cell (%s,%s) kind=%s",
       tostring(ev.x), tostring(ev.y), tostring(ev.kind))
@@ -1020,10 +1074,12 @@ local function setupFollowerInteraction(mod)
     .. "foraging, environment, friendship fallback)")
 end
 
-local MAX_CHAIN = 50
+local MAX_CHAIN = 100
 local CHAIN_SPECIES_KEY, CHAIN_COUNT_KEY = "chainSpecies", "chainCount"
 
-local CHAIN_SHINY_BASE_DENOM, CHAIN_SHINY_STEP, CHAIN_SHINY_FLOOR_DENOM = 8192, 164, 15
+-- Ramps from vanilla 1/8192 to a 1/100 floor, reached right at count 100
+-- (denom(100) = 8192 - 81*100 = 92, clamped up to the 100 floor).
+local CHAIN_SHINY_BASE_DENOM, CHAIN_SHINY_STEP, CHAIN_SHINY_FLOOR_DENOM = 8192, 81, 100
 local CHAIN_SHINY_ATTACK_DVS = { 2, 3, 6, 7, 10, 11, 14, 15 }
 
 local function chainFloorK(count)
@@ -1400,10 +1456,26 @@ local function setupDaycareReskin(mod)
   mod.log:info("overworldmons: day-care mon reskin armed")
 end
 
+-- The battle-HUD shiny glyph: a 3-sparkle tile Red++ added to its own font
+-- for the same purpose. Registered as our own font page/charmap entry
+-- (rather than assuming the base ROM's font already has it) so it draws
+-- through the normal glyph pipeline anywhere Font.draw is called.
+local SHINY_GLYPH_SEQ = "<SHINY>"
+local SHINY_GLYPH_CODE = 0x101
+
 local function setupWild(mod, Chain, Roamers)
   if not (mod.world and mod.world.effectiveEncounters and mod.world.spawnNpc) then
     mod.log:warn("overworldmons: no gen2 mod.world spawn surface; wild off")
     return
+  end
+
+  if mod.content and mod.content.font then
+    mod.content.font:register("shiny_icon", {
+      image = mod.assets:path("assets/vfx/shiny_icon.png"),
+      base = SHINY_GLYPH_CODE, glyphsPerRow = 1,
+    })
+    mod.content.font:register("charmap:shiny_icon",
+      { seq = SHINY_GLYPH_SEQ, code = SHINY_GLYPH_CODE })
   end
 
   -- A content mod that ships its own small encounters.* subset (e.g. Kanto-
@@ -1453,10 +1525,14 @@ local function setupWild(mod, Chain, Roamers)
     return cache[key]
   end
   local function spriteId(slot) return "OWM_WILD_" .. slot end
+  local function sparkleSpriteId(slot) return "OWM_SPARKLE_" .. slot end
 
   local ok, err = pcall(function()
     for slot = 1, POOL do
       mod.content.sprites:patch(spriteId(slot), bootstrapDef(mod, spriteId(slot)))
+    end
+    for slot = 1, SPARKLE_POOL do
+      mod.content.sprites:patch(sparkleSpriteId(slot), bootstrapDef(mod, sparkleSpriteId(slot)))
     end
   end)
   if not ok then
@@ -1830,6 +1906,7 @@ local function setupWild(mod, Chain, Roamers)
   local pendingDvs
   local pendingTouchClock
   local lastBattleQueueClock
+  local topUp -- forward declaration; assigned below, called from setIncenseMode
   local function clock()
     return (love and love.timer and love.timer.getTime()) or nil
   end
@@ -1845,9 +1922,27 @@ local function setupWild(mod, Chain, Roamers)
     return nil
   end
 
+  local function sparkleSlotInUse()
+    local u = {}
+    for _, w in ipairs(live) do if w.sparkleSlot then u[w.sparkleSlot] = true end end
+    return u
+  end
+  local function freeSparkleSlot()
+    local u = sparkleSlotInUse()
+    for s = 1, SPARKLE_POOL do if not u[s] then return s end end
+    return nil
+  end
+
+  local function liveShinyCount()
+    local n = 0
+    for _, w in ipairs(live) do if w.shiny then n = n + 1 end end
+    return n
+  end
+
   local function removeWanderer(i)
     local w = live[i]
     if w and w.npcId then mod.world:removeNpc(w.npcId) end
+    if w and w.sparkleNpcId then mod.world:removeNpc(w.sparkleNpcId) end
     if w and w.npcId then liveById[w.npcId] = nil end
     table.remove(live, i)
   end
@@ -1871,6 +1966,87 @@ local function setupWild(mod, Chain, Roamers)
     return nil
   end
 
+  local incenseMode = mod.save:get(INCENSE_KEY, "high")
+
+  local function densityMultiplier()
+    return INCENSE_DENSITY[incenseMode] or 1.0
+  end
+
+  -- OFF and REPEL both mean "our own wanderer pool stays empty"; REPEL
+  -- additionally leans on the engine's real repel gate (see INCENSE_REPEL_STEPS
+  -- above) so the vanilla encounters OFF re-enables never actually land either.
+  local function incenseSpawningOff()
+    return incenseMode == "off" or incenseMode == "repel"
+  end
+
+  local function setIncenseMode(mode)
+    if mode == incenseMode then return end
+    local prev = incenseMode
+    incenseMode = mode
+    mod.save:set(INCENSE_KEY, mode)
+
+    local save = mod.game and mod.game.save
+    if mode == "repel" then
+      if save then save.repelSteps = INCENSE_REPEL_STEPS end
+    elseif prev == "repel" and save and save.repelSteps == INCENSE_REPEL_STEPS then
+      -- Only clear it if it's still exactly our sentinel -- a genuine Repel
+      -- the player used in the meantime is left alone.
+      save.repelSteps = 0
+    end
+
+    despawnAll()
+    if mode ~= "off" then
+      -- low/medium/high refill the ordinary pool; repel re-syncs a roamer
+      -- (if any) right away rather than waiting for the next topUp tick.
+      local mapId, px, py = playerCell()
+      if mapId and mapId == activeMapId then topUp(px, py) end
+    end
+    mod.log:info("overworldmons: incense mode -> %s", mode)
+  end
+
+  mod.content.screens:register(INCENSE_SCREEN, {
+    new = function(game)
+      local items = {}
+      for _, m in ipairs(INCENSE_ORDER) do
+        items[#items + 1] = {
+          label = INCENSE_SHORT_LABEL[m] or m,
+          right = (m == incenseMode) and "*" or nil,
+          value = m,
+        }
+      end
+      local menu = mod.ui.ListMenu.new(game, "INCENSE", items, {
+        footer = INCENSE_DESC[incenseMode],
+        onChoose = function(item, m)
+          setIncenseMode(item.value)
+          for _, it in ipairs(m.items) do
+            it.right = (it.value == item.value) and "*" or nil
+          end
+          m.footer = INCENSE_DESC[item.value]
+        end,
+        onCancel = function() end,
+      })
+      -- ListMenu has no per-row highlight callback of its own; refreshing the
+      -- footer off menu.index every frame is the smallest way to get the
+      -- "hovering shows what it does" behaviour the SAVE-menu-style UX wants.
+      local baseUpdate = menu.update
+      function menu:update(dt)
+        baseUpdate(self, dt)
+        local hovered = self.items[self.index]
+        if hovered then self.footer = INCENSE_DESC[hovered.value] or self.footer end
+      end
+      return menu
+    end,
+  })
+
+  mod.hooks:wrap("ui.start_menu.items", function(next_, game, items)
+    local out = next_(game, items)
+    if type(out) ~= "table" then return out end
+    return mod.ui.insertBefore(out, "SAVE", {
+      label = "INCENSE",
+      onSelect = function(g) mod.ui.push(g, INCENSE_SCREEN) end,
+    })
+  end)
+
   local function spawnOne(mapId, cell, terrain, dist, r)
     local slot = freeSlot()
     if not slot then return end
@@ -1886,6 +2062,14 @@ local function setupWild(mod, Chain, Roamers)
       else
         dvs = Mon.randomDVs(); dvs.hp = Mon.hpDV(dvs)
         shiny = Mon.isShiny(dvs, { species = species, level = level })
+      end
+      -- Cap concurrent shinies on screen: a hit past the cap re-rolls plain
+      -- DVs rather than keeping the shiny-pattern/DV-floor spread unshiny,
+      -- since that spread (defense/speed/special=10, or K stats forced to
+      -- 15) reads as suspiciously good on a mon that isn't actually shiny.
+      if shiny and liveShinyCount() >= MAX_LIVE_SHINIES then
+        shiny = false
+        dvs = Mon.randomDVs(); dvs.hp = Mon.hpDV(dvs)
       end
     end
     local form
@@ -1925,7 +2109,27 @@ local function setupWild(mod, Chain, Roamers)
     liveById[npcId] = entry
     if shiny then
       mod.log:info("overworldmons: SHINY wild %s spawned on %s", species, mapId)
-      if buildSparkleFrames(mod) then entry.sparkleClock = 0 end
+      local sSlot = freeSparkleSlot()
+      local sDef = sSlot and buildSparkleDef(mod)
+      if sSlot and sDef then
+        local sSid = sparkleSpriteId(sSlot)
+        if world and world.sprites then world.sprites[sSid] = sDef end
+        local sNpcId = mod.world:spawnNpc(mapId, {
+          sprite = sSid, x = cell[1], y = cell[2],
+          movement = 6, radius = { x = 0, y = 0 },
+        })
+        if type(sNpcId) == "string" then
+          local sIndex = tonumber(sNpcId:match("_obj_(%d+)$"))
+          local sh = sIndex and mod.world:npc(mapId, sIndex)
+          if sh and sh.npc then
+            sh.npc.passable = true -- visual overlay riding the host's cell, never solid
+            if world and world.applySpritePalette then world:applySpritePalette(sh.npc) end
+          end
+          entry.sparkleNpcId, entry.sparkleIndex, entry.sparkleSlot =
+            sNpcId, sIndex, sSlot
+          entry.sparkleClock = 0
+        end
+      end
     end
   end
 
@@ -2085,7 +2289,8 @@ local function setupWild(mod, Chain, Roamers)
     end
   end
 
-  local function topUp(pcx, pcy)
+  topUp = function(pcx, pcy)
+    if incenseMode == "off" then return end
     if pending or not activeMapId or not (pcx and pcy) then return end
     local map = liveMap()
     if not (map and map.isWalkableCell and map.widthCells) then return end
@@ -2160,6 +2365,18 @@ local function setupWild(mod, Chain, Roamers)
 
     local eligible = #land + #water
     regionEligible = eligible > 0
+    -- REPEL: a real Repel doesn't stop a Gen 2 roamer either, so the sync
+    -- above still runs -- only the ordinary wanderer pool below is skipped.
+    -- This has to come AFTER regionEligible is set (not before it, like an
+    -- earlier version of this had it): topUp's own self-healing re-flood
+    -- (see the comment above needFlood) only re-attempts a dead-end flood
+    -- once regionEligible reads false, so skipping that assignment while
+    -- under REPEL left it stuck at its last real value forever -- on a map
+    -- entered into a genuinely grass-free alcove (the same Route 35-from-36
+    -- case that motivated the self-healing fix in the first place), that
+    -- meant land/water stayed empty and syncRoamers could never place a
+    -- roamer for the rest of the visit, even though it was really on the map.
+    if incenseMode == "repel" then return end
     if eligible == 0 then return end
 
     -- `totalQuota` (the region's real carrying capacity) depends only on
@@ -2182,7 +2399,8 @@ local function setupWild(mod, Chain, Roamers)
       end
     end
 
-    local target = math.min(densityCap(placementRadius), regionTotalQuota or 0)
+    local target = math.floor(
+      math.min(densityCap(placementRadius), regionTotalQuota or 0) * densityMultiplier())
     if target < 2 then target = 2 end
     local nearby = 0
     for _, w in ipairs(live) do
@@ -2362,10 +2580,28 @@ local function setupWild(mod, Chain, Roamers)
     end
 
     if activeMapId then
-      local period = SPARKLE_FRAME_SECONDS * SPARKLE_FRAMES
       for _, w in ipairs(live) do
-        if w.sparkleClock then
-          w.sparkleClock = (w.sparkleClock + (dt or 0)) % period
+        if w.sparkleIndex then
+          local h = mod.world:npc(activeMapId, w.index)
+          local sh = mod.world:npc(activeMapId, w.sparkleIndex)
+          if h and h.npc and sh and sh.npc then
+            sh.npc.cellX, sh.npc.cellY = h.npc.cellX, h.npc.cellY
+            -- +1 world-pixel (imperceptible) on py only, never px: World:
+            -- drawPeople Y-sorts the draw list on this same py field via a
+            -- plain table.sort, which is not a stable sort, so two entries
+            -- at the exact same py (host and sparkle riding its cell) can
+            -- flip which one paints on top from frame to frame. Nudging the
+            -- sparkle strictly below the host's py breaks the tie the same
+            -- way every time -- a real ordering fix within the native
+            -- Y-sorted pipeline, not the old render.hud draw-over-everything.
+            local hostPy = h.npc.py
+            sh.npc.px, sh.npc.py = h.npc.px, hostPy and hostPy + 1 or hostPy
+            w.sparkleClock = (w.sparkleClock or 0) + (dt or 0)
+            local period = SPARKLE_FRAME_SECONDS * SPARKLE_FRAMES
+            w.sparkleClock = w.sparkleClock % period
+            local frame = math.floor(w.sparkleClock / SPARKLE_FRAME_SECONDS) % SPARKLE_FRAMES
+            sh.npc.bounceFrame = function() return frame end
+          end
         end
       end
     end
@@ -2408,46 +2644,6 @@ local function setupWild(mod, Chain, Roamers)
     })
   end)
 
-  -- Shiny sparkle overlay: drawn directly over the host wanderer's own live
-  -- px/py every frame, the same fix shape as showFollowerEmote's move to
-  -- world.emote -- no companion NPC to spawn/despawn/keep in sync, so it can
-  -- never lag or settle a frame behind its host the way the old synced twin
-  -- did. Screen position replicates SpriteRenderer:getScreenOrigin's own
-  -- anchor math exactly (WORLD_ANCHOR_X/Y, bottom-anchored frame) so the
-  -- sparkle lines up on the same foot line the mon's own sprite draws from,
-  -- rather than guessing a fixed pixel offset.
-  mod.hooks:wrap("render.hud", function(next_, game, viewport)
-    next_(game, viewport)
-    if not activeMapId then return end
-    local frames = buildSparkleFrames(mod)
-    if not (frames and viewport) then return end
-    local world = mod.game and mod.game.world
-    local cam = world and world.camera
-    if not cam then return end
-    local G = love.graphics
-    local s = viewport.scale or 1
-    G.setColor(1, 1, 1, 1)
-    for _, w in ipairs(live) do
-      if w.sparkleClock and w.index then
-        local h = mod.world:npc(activeMapId, w.index)
-        local npc = h and h.npc
-        if npc then
-          local frame = math.floor(w.sparkleClock / SPARKLE_FRAME_SECONDS) % SPARKLE_FRAMES
-          local quad = frames.quads[frame]
-          if quad then
-            local baseX = math.floor(npc.px - cam.x) + WORLD_ANCHOR_X
-            local baseY = math.floor(npc.py - cam.y) + WORLD_ANCHOR_Y
-            local originX = baseX - SPARKLE_FRAME_W / 2
-            local originY = baseY - SPARKLE_FRAME_H
-            local sx = (viewport.gameX or 0) + originX * s
-            local sy = (viewport.gameY or 0) + originY * s
-            G.draw(frames.image, quad, sx, sy, 0, s, s)
-          end
-        end
-      end
-    end
-  end)
-
   mod.events:on("battle.started", function(ev)
     if ev and ev.kind == "wild" then
       local now, then_ = clock(), lastBattleQueueClock
@@ -2479,8 +2675,31 @@ local function setupWild(mod, Chain, Roamers)
       dvs.hp, enemyMon.shiny and " SHINY" or "")
   end)
 
+  -- Enemy HUD's row-1 gap left of "<LV>" (tile 1,1 / pixel 8,8): blank in
+  -- the vanilla layout, per R39's own stand-in sparkle recipe. The hook's
+  -- payload is the gen2 BattleState UI object itself (self), which has no
+  -- top-level .enemy field the way Gen 1's BattleState does -- R39's own
+  -- "battle.enemy.mon" shape is Gen-1-only; Gold's real path is
+  -- self.battle.enemy, same shape :activeMon("enemy") reads from.
+  mod.hooks:wrap("battle.overlay", function(next_, battleState)
+    next_(battleState)
+    if not (battleState and battleState.activeMon) then return end
+    -- Same gate drawEnemyHud itself uses (BattleState.lua:4201): without it
+    -- the glyph draws through the send-out intro, before the HUD it sits
+    -- next to has even slid on screen.
+    local visible = (not battleState.statusHUDVisible
+        or battleState:statusHUDVisible())
+      and battleState.showEnemyHud
+      and not (battleState.hudCleared and battleState:hudCleared("enemy"))
+    if not visible then return end
+    local enemyMon = battleState:activeMon("enemy")
+    if enemyMon and enemyMon.shiny and mod.ui and mod.ui.Font then
+      mod.ui.Font.draw(SHINY_GLYPH_SEQ, 8, 8)
+    end
+  end)
+
   mod.hooks:wrap("encounter.roll", function(next_, tables, ctx)
-    if ctx and ctx.mapId == activeMapId then return nil end
+    if ctx and ctx.mapId == activeMapId and not incenseSpawningOff() then return nil end
     return next_(tables, ctx)
   end)
 
