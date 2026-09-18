@@ -1,4 +1,8 @@
 
+-- Local aliases: avoids repeated global-table lookups in hot spatial code.
+local abs, floor, min, max, random =
+  math.abs, math.floor, math.min, math.max, math.random
+
 local MAX_DEX = 493
 local FALLBACK_DEX = 25
 local UNOWN_DEX = 201
@@ -22,13 +26,8 @@ local function unownLetter(mon)
   return idx and Unown.name(idx) or nil
 end
 
--- We only ever READ a mon's current form here -- who decides/writes it (a
--- spawn roll, a trigger event, a weather hook) is out of scope for this mod.
--- No reader for a dex means we render its base/default sprite, same as any
--- other species; mon._krCastformForm is Kanto-Reforged's own interop field
--- (battle-scoped, usually nil in the overworld) -- read only, never written.
--- KR names its weather suffixes sunny/rainy/snowy; the atlas keys Castform's
--- forms sun/rain/cloud (no snow form exists in it) -- translate at the read.
+-- Read-only: mon._krCastformForm is KR's interop field. Translate KR's
+-- sunny/rainy/snowy names to the atlas's sun/rain/cloud keys (no snow form).
 local CASTFORM_FORM_MAP = { sunny = "sun", rainy = "rain", snowy = "cloud" }
 
 local FORM_READERS = {
@@ -59,7 +58,7 @@ end
 local CARD, FRAME_COUNT = 16, 6
 local RUNTIME_SHADES = { 0, 85, 170 }
 local RUNTIME_SHADES_85_170 = { 85, 170 }
-local RUNTIME = { pals = nil, warned = {} }
+local RUNTIME = { pals = nil, warned = {}, spriteImages = {} }
 
 local function hexToUnit(h)
   return tonumber(h:sub(2, 3), 16) / 255,
@@ -131,9 +130,7 @@ local function decodeFlatJson(raw)
   return parseValue()
 end
 
--- Combined manifest: assets/mon/atlas.json keys every (dex[, "_" form]) to a
--- {frame={x,y,w,h}, normal={...}, shiny={...}, shades={...}} entry -- frame
--- position and recolor palette live in one file (see tools/build_combined_atlas.py).
+-- atlas.json keys (dex[, "_" form]) to {frame, normal, shiny, shades}.
 local function loadManifest(mod)
   if RUNTIME.manifest ~= nil then return RUNTIME.manifest or nil end
   local manifest = false
@@ -158,7 +155,7 @@ end
 local function nearestShade(v255)
   local best, bestDelta = RUNTIME_SHADES[1], math.huge
   for _, s in ipairs(RUNTIME_SHADES) do
-    local d = math.abs(s - v255)
+    local d = abs(s - v255)
     if d < bestDelta then bestDelta, best = d, s end
   end
   return best
@@ -177,7 +174,7 @@ local function buildRuntimeSheet(atlasData, atlasX0, atlasY0, lut, submerge)
       for x = 0, CARD - 1 do
         local r, _, _, a = atlasData:getPixel(atlasX0 + x, atlasY0 + y)
         if a > 0 then
-          local shade = nearestShade(math.floor(r * 255 + 0.5))
+          local shade = nearestShade(floor(r * 255 + 0.5))
           local c = lut[shade]
           if c then out:setPixel(x, y, c[1], c[2], c[3], a) end
         end
@@ -208,48 +205,59 @@ local function buildRuntimeSheet(atlasData, atlasX0, atlasY0, lut, submerge)
   return out
 end
 
+-- The built IMAGE is cached by (dex, terrain, form, shiny) and shared across
+-- callers. The def TABLE is rebuilt fresh every call since its `id` prefix
+-- is a real type-tag (reskin fixups read it), not safe to share.
 local function spriteDefFor(mod, idPrefix, dex, terrain, form, shiny)
   if not (love and love.image) then return nil end
-  local manifest = loadManifest(mod)
-  if not manifest then return nil end
 
   local key = dex .. "_" .. terrain .. (form and ("_" .. form) or "")
     .. (shiny and "_S" or "")
-  local ok, result = pcall(function()
-    local atlasData = loadAtlasImage(mod)
-    if not atlasData then error("atlas.png unavailable") end
-    local atlasKey = tostring(dex)
-    if form then
-      local suffixed = dex .. "_" .. form
-      if manifest[suffixed] then atlasKey = suffixed end
-    end
-    local entry = manifest[atlasKey]
-    if not entry then error("no atlas entry for " .. atlasKey) end
-    local colors = (shiny and entry.shiny) or entry.normal
-    local frame = entry.frame
-    -- Shade 0 (outline) is always black and omitted from the manifest;
-    -- colors[1]/[2] are shade 85/170 (some species have no shade 170).
-    local lut = { [0] = { 0, 0, 0 } }
-    for i, shade in ipairs(RUNTIME_SHADES_85_170) do
-      if colors[i] then
-        local r, g, b = hexToUnit(colors[i])
-        lut[shade] = { r, g, b }
+  local image = RUNTIME.spriteImages[key]
+  if image == nil then
+    local manifest = loadManifest(mod)
+    if not manifest then return nil end
+
+    local ok, result = pcall(function()
+      local atlasData = loadAtlasImage(mod)
+      if not atlasData then error("atlas.png unavailable") end
+      local atlasKey = tostring(dex)
+      if form then
+        local suffixed = dex .. "_" .. form
+        if manifest[suffixed] then atlasKey = suffixed end
       end
+      local entry = manifest[atlasKey]
+      if not entry then error("no atlas entry for " .. atlasKey) end
+      local colors = (shiny and entry.shiny) or entry.normal
+      local frame = entry.frame
+      -- Shade 0 (outline) is always black and omitted from the manifest;
+      -- colors[1]/[2] are shade 85/170 (some species have no shade 170).
+      local lut = { [0] = { 0, 0, 0 } }
+      for i, shade in ipairs(RUNTIME_SHADES_85_170) do
+        if colors[i] then
+          local r, g, b = hexToUnit(colors[i])
+          lut[shade] = { r, g, b }
+        end
+      end
+      return buildRuntimeSheet(atlasData, frame[1], frame[2], lut, terrain == "water")
+    end)
+    if not ok then
+      if not RUNTIME.warned[key] then
+        RUNTIME.warned[key] = true
+        mod.log:error("overworldmons: sprite build failed for "
+          .. key .. " (no sprite for this combo): " .. tostring(result))
+      end
+      RUNTIME.spriteImages[key] = false
+      return nil
     end
-    return buildRuntimeSheet(atlasData, frame[1], frame[2], lut, terrain == "water")
-  end)
-  if not ok then
-    if not RUNTIME.warned[key] then
-      RUNTIME.warned[key] = true
-      mod.log:error("overworldmons: sprite build failed for "
-        .. key .. " (no sprite for this combo): " .. tostring(result))
-    end
-    return nil
+    image = result
+    RUNTIME.spriteImages[key] = image
   end
+  if not image then return nil end -- cached failure
 
   return {
     id = idPrefix .. (terrain == "water" and "W_" or "") .. key,
-    image = result,
+    image = image,
     frames = FRAME_COUNT,
     walker = true,
     spriteType = "WALKING_SPRITE",
@@ -292,16 +300,8 @@ end
 
 local SPARKLE_POOL = 8
 
--- A real companion NPC riding the host wanderer's cell (movement=6/stay,
--- passable, radius 0x0), not a hand-drawn render.hud overlay: the overlay
--- version's own screen math (camera-relative px/py * viewport.scale) skipped
--- World:zoomScale()'s survey-zoom offset, which native NPC drawing applies --
--- correct at the default 1:1 zoom but dramatically offset at any other zoom
--- level, and it kept drawing over the battle screen since render.hud has no
--- "are we in battle" gate. Riding a real NPC sidesteps both: the engine's own
--- getScreenOrigin/anchorX/anchorY positions it exactly like every other
--- sprite, and it disappears with the rest of the world NPCs once battle
--- starts.
+-- A real companion NPC (not a render.hud overlay) so native draw handles
+-- zoom offset and battle-screen hiding for free.
 local function buildSparkleDef(mod)
   if RUNTIME.sparkleDef ~= nil then return RUNTIME.sparkleDef or nil end
   local def = false
@@ -320,7 +320,7 @@ local function buildSparkleDef(mod)
       for x = 0, SPARKLE_FRAME_W - 1 do
         local r, _, _, a = src:getPixel(x, y)
         if a > 0 then
-          local shade = nearestShade(math.floor(r * 255 + 0.5))
+          local shade = nearestShade(floor(r * 255 + 0.5))
           local c = lut[shade]
           if c then out:setPixel(x, y, c[1], c[2], c[3], a) end
         end
@@ -357,16 +357,8 @@ local DESPAWN_SLACK = 6
 local MIN_WANDERER_SPACING = 3
 local STEP_THROTTLE = 2
 
--- BUGS.md item 17: a start-menu key item ("INCENSE") opening a submenu that
--- cycles the wanderer density. OFF turns our own wanderer spawning off
--- (roamers included) and lets the map's real encounter.roll proceed
--- uninterrupted, i.e. plain vanilla. REPEL does the same for ordinary
--- wanderers but leaves the roamer sync running (real Repel doesn't stop a
--- Gen 2 roamer either), and additionally stamps save.repelSteps with a
--- sentinel far past anything a real Repel ever reaches, so the engine's own
--- native repel gate (World:repelSuppresses) blocks every ordinary encounter
--- the same way a real one would, without us having to reimplement that gate
--- ourselves.
+-- INCENSE submenu cycles wanderer density; REPEL also stamps save.repelSteps
+-- so the engine's own repel gate blocks ordinary encounters for us.
 local INCENSE_KEY = "incenseMode"
 local INCENSE_SCREEN = "OverworldmonsIncense"
 local INCENSE_ORDER = { "off", "low", "medium", "high", "repel" }
@@ -386,34 +378,46 @@ local INCENSE_REPEL_STEPS = 999999
 local DECAY_MIN_SECONDS = 20
 local DECAY_MAX_SECONDS = 35
 
--- gen2/Npc.lua MOVE.STANDING_DOWN: no autonomous wander, and (unlike MOVE.STILL)
--- not in FIXED_FACING_MOVE, so scriptStep is still free to turn it to face
--- whichever direction it steps. Chosen over requiring either engine's native
--- follower module (src.world.PikachuFollower / src.world.gen2.Follower)
--- directly: Gen 1's real module has no programmatic spawn-condition hook and
--- is hard-wired to a party PIKACHU, so a from-scratch mod-owned NPC is what
--- both generations will eventually share, not a Gen2-only convenience.
+-- MOVE.STANDING_DOWN: no autonomous wander, but scriptStep can still turn it.
+-- A mod-owned NPC (not the engine's Pikachu-only follower module) so both
+-- generations can share it.
 local NPC_MOVE_STAND = 6
 
 local followerNpcId, followerIndex, followerMapId
+-- Captured once at spawn: WorldAPI:npc() is a linear scan + fresh table alloc
+-- per call, too costly for the per-tick reskin()/advanceMovement() lookups.
+-- rebuildPeople keeps mod-spawned npcs as the same table, so this stays valid.
+local followerNpcRef
 local followerTrail, followerGoal
 local pokeballAnim -- in-flight Pokeball drop sequence, see startPokeballDrop
 local pendingHealBall = false -- true while waiting for script.ended after a heal
 local followerBootSpawn = false -- true for one spawn after a via=="boot" map.entered
-local hideFollowerEmote, npcHasActiveEmote -- forward-declared: defined near
--- the emote helpers below, but despawnFollower (every map transition) and
--- reskin (every step, to catch a follower going invisible on water) both
--- need to reach them before that point in the file.
+-- A seamless connection crossing keeps coordinates continuous, so the
+-- follower's offset from the player survives it. map.exited snapshots that
+-- offset into pendingHandoff; map.entered promotes it to
+-- pendingConnectionOffset for reskin() to re-apply on respawn.
+local pendingHandoff, pendingConnectionOffset
+local hideFollowerEmote, npcHasActiveEmote
 
 local function currentFollowerHandle(mod)
-  if not (followerMapId and followerIndex) then return nil end
-  local h = mod.world:npc(followerMapId, followerIndex)
-  return h and h.npc or nil
+  return followerNpcRef
+end
+
+-- Detects the engine dropping our npc from world.npcs outside despawnFollower
+-- (rebuildPeople has many call sites). Checked periodically, not per-frame,
+-- to avoid reintroducing the O(world.npcs) cost the ref cache avoids.
+local function followerRefIsStale(world)
+  if not followerNpcRef then return false end
+  for _, npc in ipairs(world and world.npcs or {}) do
+    if npc == followerNpcRef then return false end
+  end
+  return true
 end
 
 local function despawnFollower(mod)
   if followerNpcId then mod.world:removeNpc(followerNpcId) end
   followerNpcId, followerIndex, followerMapId = nil, nil, nil
+  followerNpcRef = nil
   followerTrail, followerGoal = nil, nil
   if pokeballAnim then
     mod.world:removeNpc(pokeballAnim.npcId)
@@ -441,7 +445,11 @@ local function spawnFollower(mod, mapId, cx, cy, facing)
   -- -1 py so a same-cell overlap with the player always sorts behind them (World:drawPeople draws ascending py last-on-top)
   h.npc.px, h.npc.py = cx * 16, cy * 16 - 1
   followerNpcId, followerIndex, followerMapId = npcId, index, mapId
-  followerTrail = { x = cx, y = cy }
+  followerNpcRef = h.npc
+  -- Seed the trail to the PLAYER's cell, not the spawn cell, so
+  -- advanceMovement doesn't stall for a tile when spawned off-player.
+  local p = mod.game and mod.game.world and mod.game.world.player
+  followerTrail = p and { x = p.cellX, y = p.cellY } or { x = cx, y = cy }
   followerGoal = nil
 end
 
@@ -457,6 +465,10 @@ local POKEBALL_BOUNCE_PX = 10
 local FOLLOWER_BEHIND_DELTA = { -- opposite of facing, for the heal ball's drop cell
   up = { 0, 1 }, down = { 0, -1 }, left = { 1, 0 }, right = { -1, 0 },
 }
+
+-- Mirrors Map.DELTA: map.entered fires before tryConnection's rewind of
+-- player.cellX/Y, so this anticipates it to avoid a one-frame flash.
+local CONNECTION_DIR_DELTA = { up = { 0, -1 }, down = { 0, 1 }, left = { -1, 0 }, right = { 1, 0 } }
 
 local function behindPlayerCell(world, p)
   local delta = FOLLOWER_BEHIND_DELTA[p.facing]
@@ -539,17 +551,20 @@ local function startPokeballDrop(mod, mapId, cx, cy, facing) -- cx/cy is exactly
   h.npc.passable = true
   h.npc.facing = "down"
   pokeballAnim = {
-    mapId = mapId, npcId = npcId, index = index,
+    mapId = mapId, npcId = npcId, index = index, npcRef = h.npc,
     cx = cx, cy = cy, facing = facing or "down",
-    phase = "drop", clock = 0,
+    phase = "drop", clock = 0, frame = POKEBALL_FRAME_CLOSED,
   }
+  -- Installed once, not rebuilt every frame.
+  local anim = pokeballAnim
+  h.npc.bounceFrame = function() return anim.frame end
 end
 
 local function updatePokeballDrop(mod, dt)
   if not pokeballAnim then return end
   local a = pokeballAnim
-  local h = mod.world:npc(a.mapId, a.index)
-  if not (h and h.npc) then
+  local npc = a.npcRef
+  if not npc then
     pokeballAnim = nil
     return
   end
@@ -557,7 +572,7 @@ local function updatePokeballDrop(mod, dt)
 
   local frame, offsetPx = POKEBALL_FRAME_CLOSED, 0
   if a.phase == "drop" then
-    local u = math.min(1, a.clock / POKEBALL_DROP_SECONDS)
+    local u = min(1, a.clock / POKEBALL_DROP_SECONDS)
     offsetPx = pokeballDropOffsetPx(u)
     if a.clock >= POKEBALL_DROP_SECONDS then a.phase, a.clock = "opening", 0 end
   elseif a.phase == "opening" then
@@ -572,19 +587,15 @@ local function updatePokeballDrop(mod, dt)
       return
     end
   end
-  h.npc.px, h.npc.py = a.cx * 16, a.cy * 16 - offsetPx
-  h.npc.bounceFrame = function() return frame end
+  npc.px, npc.py = a.cx * 16, a.cy * 16 - offsetPx
+  a.frame = frame
 end
 
 local function setupFollower(mod)
-  local defs = { land = {}, water = {} }
+  -- spriteDefFor caches by (dex, terrain, form, shiny) itself now, shared
+  -- across every system that calls it -- no per-system cache needed here.
   local function defFor(dex, terrain, form, shiny)
-    local cache = defs[terrain]
-    local key = (form and (dex .. form) or dex) .. (shiny and "S" or "")
-    if not cache[key] then
-      cache[key] = spriteDefFor(mod, "OWM_FOLLOWER_", dex, terrain, form, shiny)
-    end
-    return cache[key]
+    return spriteDefFor(mod, "OWM_FOLLOWER_", dex, terrain, form, shiny)
   end
 
   do
@@ -613,21 +624,38 @@ local function setupFollower(mod)
     return nil
   end
 
-  local function canSwim(mon, rec)
+  -- Species water-type/Surf-TMHM eligibility is cached by dex (static data);
+  -- mon.moves is checked fresh each call since it can change at runtime.
+  local canSwimBySpecies = {}
+  local function speciesCanSwim(dex, rec)
+    local cached = canSwimBySpecies[dex]
+    if cached ~= nil then return cached end
+    local result = false
     for _, t in ipairs(rec and rec.types or {}) do
-      if t == "WATER" then return true end
+      if t == "WATER" then result = true; break end
     end
-    for _, m in ipairs(rec and rec.tmhm or {}) do
-      if m == "SURF" then return true end
+    if not result then
+      for _, m in ipairs(rec and rec.tmhm or {}) do
+        if m == "SURF" then result = true; break end
+      end
     end
+    canSwimBySpecies[dex] = result
+    return result
+  end
+
+  local function canSwim(dex, mon, rec)
+    if speciesCanSwim(dex, rec) then return true end
     for _, m in ipairs(mon and mon.moves or {}) do
       if (type(m) == "table" and m.id or m) == "SURF" then return true end
     end
     return false
   end
 
-  local lastKey
-  local lastDex -- separate from lastKey: only a real species change should Pokeball
+  local lastTerrain, lastForm, lastShinyApplied
+  local lastDex -- only a real species change should Pokeball
+  -- Cached by dvs table reference (a real dvs edit reassigns the table),
+  -- so this avoids re-running Mon.isShiny every tick when nothing changed.
+  local lastDvsRef, lastMonShiny
 
   local function reskin(game, world)
     local mon, rec = leadMon(mod, game, world)
@@ -635,7 +663,9 @@ local function setupFollower(mod)
     local npc = currentFollowerHandle(mod)
 
     if not dex then
-      lastKey, lastDex = nil, nil
+      lastDex, lastTerrain, lastForm, lastShinyApplied = nil, nil, nil, nil
+      lastDvsRef = nil
+      pendingConnectionOffset = nil -- no lead to carry a stale cross-seam offset for
       if npc then despawnFollower(mod) end
       return
     end
@@ -649,40 +679,51 @@ local function setupFollower(mod)
           followerBootSpawn = false
           local cx, cy = findFreeSpawnCell(world, p)
           spawnFollower(mod, mapId, cx, cy, p.facing)
+        elseif pendingConnectionOffset then
+          local off = pendingConnectionOffset
+          pendingConnectionOffset = nil
+          local cx, cy = p.cellX + off.dx, p.cellY + off.dy
+          -- A small offset (e.g. x=-1) is a real transitional cell, not a
+          -- wall; only a large/stale offset falls back to co-located spawn.
+          if abs(off.dx) > 1 or abs(off.dy) > 1 then
+            cx, cy = p.cellX, p.cellY
+          end
+          spawnFollower(mod, mapId, cx, cy, p.facing)
         else
           spawnFollower(mod, mapId, p.cellX, p.cellY, p.facing)
         end
       end
       npc = currentFollowerHandle(mod)
-      lastKey, lastDex = nil, nil
+      lastDex, lastTerrain, lastForm, lastShinyApplied = nil, nil, nil, nil
     end
     if not npc then return end
 
+    if mon.dvs ~= lastDvsRef then
+      lastDvsRef = mon.dvs
+      lastMonShiny = Mon and mon.dvs
+        and Mon.isShiny(mon.dvs, { species = mon.species, level = mon.level })
+    end
+    local shiny = lastMonShiny
+
     local onWater = followerTerrain(world, npc) == "water"
-    local swims = onWater and canSwim(mon, rec)
+    local swims = onWater and canSwim(dex, mon, rec)
     npc.hiddenByMovement = (onWater and not swims) or nil
-    -- Once the follower goes invisible (surfing on a non-water/non-Surf
-    -- lead), it must stop being interactable too -- forage/interaction
-    -- triggers are already gated on hiddenByMovement above/below, but a
-    -- bubble rolled just before entering the water would otherwise keep
-    -- floating over nothing, which is the "spawns at the origin" report.
     if npc.hiddenByMovement and npcHasActiveEmote(npc) then
       hideFollowerEmote(mod)
     end
 
     local form = formOf(dex, mon)
     local terrain = swims and "water" or "land"
-    local shiny = Mon and mon.dvs
-      and Mon.isShiny(mon.dvs, { species = mon.species, level = mon.level })
-    local key = dex .. ":" .. terrain .. ":" .. (form or "") .. (shiny and ":S" or "")
 
-    if key ~= lastKey then
+    -- Compared field-by-field to avoid building a string key every tick.
+    if dex ~= lastDex or terrain ~= lastTerrain or form ~= lastForm
+        or shiny ~= lastShinyApplied then
       if lastDex ~= nil and dex ~= lastDex then -- a real species change, not just terrain/shiny
         if game.stack and game.stack:top() then return end -- wait for the party menu to close
         local cx, cy, facing = npc.cellX, npc.cellY, npc.facing
         local mapId = world and world.map and world.map.id
         despawnFollower(mod)
-        lastKey, lastDex = nil, nil
+        lastDex, lastTerrain, lastForm, lastShinyApplied = nil, nil, nil, nil
         startPokeballDrop(mod, mapId, cx, cy, facing)
         return
       end
@@ -693,23 +734,15 @@ local function setupFollower(mod)
       if npc.setSpriteDef and npc:setSpriteDef(def) then
         if world.applySpritePalette then world:applySpritePalette(npc) end
       end
-      lastKey, lastDex = key, dex
+      lastDex, lastTerrain, lastForm, lastShinyApplied = dex, terrain, form, shiny
       mod.log:info("overworldmons: follower sheet -> dex %d (%s%s)%s", dex, terrain,
         form and (" " .. form) or "", shiny and " SHINY" or "")
     end
   end
 
-  -- Ported from gen2/Follower.lua's own update(), which runs every frame off
-  -- the player's LIVE in-flight step (p.targetX/Y, set the instant a step is
-  -- committed) rather than a "step landed" event -- reacting only on
-  -- world.stepped (fires once the step completes) added a structural extra
-  -- delay every single step that compounded under continuous movement,
-  -- which is why the follower fell further and further behind instead of
-  -- holding a steady one-cell gap. Also missing before: matching the
-  -- follower's own stepFrames to the player's real step speed (so a faster
-  -- player, e.g. biking, doesn't leave it in the dust) and halving that
-  -- once more than one cell behind, exactly like the real "FastPikachuFollow"
-  -- catch-up the native modules use.
+  -- Tracks the player's live in-flight step (targetX/Y) rather than a
+  -- "step landed" event, to avoid falling behind under continuous movement.
+  -- Matches follower stepFrames to player speed, halved when >1 cell behind.
   local function advanceMovement(world)
     local npc = currentFollowerHandle(mod)
     local p = world and world.player
@@ -730,7 +763,7 @@ local function setupFollower(mod)
     end
 
     -- more than a screen behind (a warp, a scripted move): snap, don't walk
-    local far = math.abs(npc.cellX - gx) + math.abs(npc.cellY - gy)
+    local far = abs(npc.cellX - gx) + abs(npc.cellY - gy)
     if far > 6 then
       npc.cellX, npc.cellY = gx, gy
       npc.px, npc.py = gx * 16, gy * 16
@@ -746,30 +779,126 @@ local function setupFollower(mod)
     if not (dir and npc.scriptStep) then return end
     npc:scriptStep(dir)
     local stepLen = p.stepFrames or 16
-    if far > 1 then stepLen = math.max(1, math.floor(stepLen / 2)) end
+    if far > 1 then stepLen = max(1, floor(stepLen / 2)) end
     npc.stepFrames = stepLen
   end
 
-  -- No respawn here: player position isn't settled until the next input.step tick, reskin() handles it
+  -- No respawn here for a plain warp/door/boot: player position isn't
+  -- settled until the next input.step tick, reskin() handles it.
   mod.events:on("map.entered", function(ev)
-    lastKey, lastDex = nil, nil
+    lastDex, lastTerrain, lastForm, lastShinyApplied = nil, nil, nil, nil
+    lastDvsRef = nil
     despawnFollower(mod)
     followerBootSpawn = (ev and ev.via == "boot") or false
+    pendingConnectionOffset = nil
+    -- Only a connection crossing keeps coordinates continuous; a warp/door
+    -- lands unrelated to where the player left, so skip pendingHandoff there.
+    if not (ev and ev.via == "connection" and pendingHandoff) then return end
+    -- Respawn synchronously (no fade to hide a one-frame flash otherwise).
+    -- Falls back to the deferred path if anything here isn't ready.
+    if pokeballAnim or pendingHealBall then
+      pendingConnectionOffset = pendingHandoff
+      return
+    end
+    local world = mod.game and mod.game.world
+    local p = world and world.player
+    local mapId = world and world.map and world.map.id
+    local delta = p and CONNECTION_DIR_DELTA[p.facing]
+    local mon, rec = leadMon(mod, mod.game, world)
+    if not (world and p and mapId and delta and mon) then
+      pendingConnectionOffset = pendingHandoff
+      return
+    end
+    local off = pendingHandoff
+    local settledX, settledY = p.cellX - delta[1], p.cellY - delta[2]
+    local cx, cy = settledX + off.dx, settledY + off.dy
+    if abs(off.dx) > 1 or abs(off.dy) > 1 then
+      cx, cy = settledX, settledY -- stale/implausible offset: co-locate instead
+    end
+    spawnFollower(mod, mapId, cx, cy, p.facing)
+    -- Re-seed the trail to the settled cell, not the live un-rewound one.
+    followerTrail = { x = settledX, y = settledY }
+    lastDex, lastTerrain, lastForm, lastShinyApplied = nil, nil, nil, nil
+    lastDvsRef = nil
+    -- Apply hiddenByMovement immediately (bypassing reskin() for this tick)
+    -- so a non-swimming lead doesn't flash visible on a water crossing.
+    local followerNpc = currentFollowerHandle(mod)
+    if followerNpc then
+      -- Off the new map's grid, isWaterCell/isWalkableCell can't distinguish
+      -- "land" from "off the edge of the data", so trust the terrain
+      -- snapshotted off the OLD map (map.exited) instead.
+      local onNewGrid = world.map and world.map.widthCells and world.map.heightCells
+        and cx >= 0 and cy >= 0 and cx < world.map.widthCells and cy < world.map.heightCells
+      local onWater
+      if onNewGrid then
+        onWater = followerTerrain(world, followerNpc) == "water"
+      else
+        onWater = off.wasOnWater or false
+      end
+      local swims = onWater and canSwim(dexOfRec(rec) or FALLBACK_DEX, mon, rec)
+      followerNpc.hiddenByMovement = (onWater and not swims) or nil
+    end
   end)
 
-  mod.events:on("map.exited", function() despawnFollower(mod) end)
+  -- Fires while world.player/the follower npc still hold their real
+  -- pre-transition positions (setMap emits this before touching either), so
+  -- this is the only point the offset between them can still be read.
+  mod.events:on("map.exited", function()
+    local world = mod.game and mod.game.world
+    local npc, p = currentFollowerHandle(mod), world and world.player
+    pendingHandoff = (npc and p) and { dx = npc.cellX - p.cellX, dy = npc.cellY - p.cellY,
+      -- Snapshotted now, while the OLD map can still answer for the follower's own cell.
+      wasOnWater = followerTerrain(world, npc) == "water" } or nil
+    despawnFollower(mod)
+  end)
 
-  mod.hooks:wrap("input.step", function(next_, game, dt)
-    next_(game, dt)
+  -- A pool rebuild that misses (non-seamless rebuild, mod-caused eviction)
+  -- allocates a new npc table for our follower and fires this event; re-point
+  -- followerNpcRef immediately instead of waiting for the 1s stale check.
+  mod.events:on("world.npc_spawned", function(ev)
+    if not (ev and followerNpcId and ev.npcId == followerNpcId) then return end
+    -- Not mod.world:npc(): pooledNpc fires this before the new npc is
+    -- inserted into world.npcs, so read world.npcPool directly instead.
+    local world = mod.game and mod.game.world
+    local npc = world and world.npcPool and world.npcPool[ev.npcId]
+    if npc and npc ~= followerNpcRef then
+      followerNpcRef = npc
+      mod.log:info("overworldmons: follower npc identity re-synced after a pool rebuild")
+    end
+  end)
+
+  local followerVerifyClock = 0
+  local FOLLOWER_VERIFY_INTERVAL = 1
+
+  local function tickFollower(game, dt)
     local world = mod.game and mod.game.world
     if world then
+      followerVerifyClock = followerVerifyClock + (dt or 0)
+      if followerVerifyClock >= FOLLOWER_VERIFY_INTERVAL then
+        followerVerifyClock = followerVerifyClock % FOLLOWER_VERIFY_INTERVAL
+        -- Backstop for a genuinely removed npc (npc_spawned above only
+        -- fires for a recreated one); despawnFollower, not a bare nil-out,
+        -- to avoid leaking an orphaned duplicate.
+        if followerRefIsStale(world) then
+          despawnFollower(mod)
+        end
+      end
       reskin(game, world)
       advanceMovement(world)
+      -- Keep the follower's map-object def synced to its live cell, or an
+      -- off-grid seam-crossing spawn cell gets it dropped by rebuildPeople.
+      local fnpc, map = followerNpcRef, world.map
+      if fnpc and fnpc.def and map and map.id == followerMapId
+          and fnpc.cellX and fnpc.cellY and fnpc.cellX >= 0 and fnpc.cellY >= 0
+          and fnpc.cellX < (map.widthCells or 0) and fnpc.cellY < (map.heightCells or 0) then
+        fnpc.def.x, fnpc.def.y = fnpc.cellX, fnpc.cellY
+      end
     end
     updatePokeballDrop(mod, dt)
-  end)
+  end
 
   mod.log:info("overworldmons: follower armed")
+  return tickFollower
 end
 
 -- Despawns on HealParty, redrops the ball once the whole script ends (not just the heal)
@@ -847,14 +976,13 @@ local function showFollowerEmote(mod, world, followerNpc, frameIndex, opts)
   local image = emoteFrameImage(mod, frameIndex)
   if not image then return end
   ownEmote = { image = image, entity = followerNpc,
-    left = math.floor((opts.holdSeconds or EMOTE_DEFAULT_HOLD) * 60 + 0.5) }
+    left = floor((opts.holdSeconds or EMOTE_DEFAULT_HOLD) * 60 + 0.5) }
   world.emote = ownEmote
   emotePersistent = opts.persistent and true or false
 end
 
 local function setupFollowerEmotes(mod)
-  mod.hooks:wrap("input.step", function(next_, game, dt)
-    next_(game, dt)
+  local function tickFollowerEmotes(game, dt)
     if not (emotePersistent and ownEmote) then return end
     local world = mod.game and mod.game.world
     if world and world.emote == ownEmote then
@@ -862,7 +990,8 @@ local function setupFollowerEmotes(mod)
     else
       ownEmote, emotePersistent = nil, false
     end
-  end)
+  end
+  return tickFollowerEmotes
 end
 
 local CRY_PITCH = { pained = 0.75, joyous = 1.25, standard = 1.0 }
@@ -928,7 +1057,7 @@ local FORAGE_NOROOM_TIER = { emote = EMOTE.SAD, cry = "pained",
   text = "%s found something, but there's no room for it!" }
 
 local function forageRng()
-  return ((love and love.math and love.math.random) or math.random)()
+  return ((love and love.math and love.math.random) or random)()
 end
 
 local function weightedPick(pool)
@@ -1003,7 +1132,7 @@ local function rollForage(mod, world, mon)
     end
   end
   if not itemName then
-    itemName = weightedPick(FORAGE_POOLS[math.min(forageTier(mon), 3)])
+    itemName = weightedPick(FORAGE_POOLS[min(forageTier(mon), 3)])
   end
 
   forageState.ready, forageState.rare, forageState.itemName = true, rare, itemName
@@ -1210,6 +1339,7 @@ local function setupFollowerInteraction(mod)
     local npc = currentFollowerHandle(mod)
     if not (npc and npc.cellX == ev.x and npc.cellY == ev.y) then return end
     if npc.hiddenByMovement then return end
+    if npc.facePlayer and world.player then npc:facePlayer(world.player) end
     mod.log:info(
       "overworldmons: world.interacted at follower cell (%s,%s) kind=%s",
       tostring(ev.x), tostring(ev.y), tostring(ev.kind))
@@ -1218,8 +1348,7 @@ local function setupFollowerInteraction(mod)
     runFollowerInteraction(mod, world, npc, mon, rec)
   end)
 
-  mod.hooks:wrap("input.step", function(next_, game, dt)
-    next_(game, dt)
+  local function tickFollowerText(game, dt)
     if not pendingFollowerText then return end
     local input = game and game.input
     if input and (input:isDown("a") or input:isDown("b")
@@ -1239,11 +1368,12 @@ local function setupFollowerInteraction(mod)
     elseif p.onDone then
       p.onDone()
     end
-  end)
+  end
 
   mod.log:info(
     "overworldmons: follower interaction armed (Phase A+B+C: health/status, "
     .. "foraging, environment, friendship fallback)")
+  return tickFollowerText
 end
 
 local MAX_CHAIN = 100
@@ -1281,7 +1411,7 @@ local function setupChain(mod)
   local function resolveWild(resolvedSpecies)
     if not resolvedSpecies then return end
     if species == resolvedSpecies then
-      count = math.min(MAX_CHAIN, count + 1)
+      count = min(MAX_CHAIN, count + 1)
     else
       species, count = resolvedSpecies, 1
     end
@@ -1290,21 +1420,21 @@ local function setupChain(mod)
 
   local function forceSpecies(dist, r)
     if not (species and count > 1 and dist and dist[species]) then return nil end
-    local odds = 10 - math.min(count, 9)
-    if math.floor(r() * odds) == 0 then return species end
+    local odds = 10 - min(count, 9)
+    if floor(r() * odds) == 0 then return species end
     return nil
   end
 
   local function rollDVs(forSpecies, level, r, Mon)
     local dvs
     if forSpecies == species and count > 0 then
-      local denom = math.max(CHAIN_SHINY_FLOOR_DENOM,
+      local denom = max(CHAIN_SHINY_FLOOR_DENOM,
         CHAIN_SHINY_BASE_DENOM - CHAIN_SHINY_STEP * count)
-      if math.floor(r() * denom) == 0 then
+      if floor(r() * denom) == 0 then
         dvs = {
           defense = 10, speed = 10, special = 10,
           attack = CHAIN_SHINY_ATTACK_DVS[
-            math.floor(r() * #CHAIN_SHINY_ATTACK_DVS) + 1],
+            floor(r() * #CHAIN_SHINY_ATTACK_DVS) + 1],
         }
       else
         dvs = Mon.randomDVs()
@@ -1312,7 +1442,7 @@ local function setupChain(mod)
         if k > 0 then
           local stats = { "attack", "defense", "speed", "special" }
           for i = #stats, 2, -1 do
-            local j = math.floor(r() * i) + 1
+            local j = floor(r() * i) + 1
             stats[i], stats[j] = stats[j], stats[i]
           end
           for i = 1, k do dvs[stats[i]] = 15 end
@@ -1417,37 +1547,35 @@ local function setupOverworldReskin(mod)
   end
 
   local done = false
-  mod.hooks:wrap("input.step", function(next_, game, dt)
-    if not done then
-      local world = game and game.world
-      if world and world.sprites then
-        done = true
-        local patched, skipped = 0, 0
-        for spriteId, r in pairs(RESKIN) do
-          local applyOk, applyErr = pcall(function()
-            local rec = mod.content.pokemon:get(r.species)
-            local dex = rec and rec.dex
-            if type(dex) ~= "number" or dex < 1 or dex > MAX_DEX then
-              error("no dex for species " .. tostring(r.species))
-            end
-            local def = spriteDefFor(mod, "OWM_OWMON_", dex, "land", nil, r.shiny)
-            if not def then error("spriteDefFor returned nil") end
-            world.sprites[spriteId] = def
-          end)
-          if applyOk then
-            patched = patched + 1
-          else
-            skipped = skipped + 1
-            mod.log:warn("overworldmons: NPC-mon reskin skipped " .. spriteId
-              .. " (" .. tostring(r.species) .. "): " .. tostring(applyErr))
-          end
+  local function tickOverworldReskin(game, dt)
+    if done then return end
+    local world = game and game.world
+    if not (world and world.sprites) then return end
+    done = true
+    local patched, skipped = 0, 0
+    for spriteId, r in pairs(RESKIN) do
+      local applyOk, applyErr = pcall(function()
+        local rec = mod.content.pokemon:get(r.species)
+        local dex = rec and rec.dex
+        if type(dex) ~= "number" or dex < 1 or dex > MAX_DEX then
+          error("no dex for species " .. tostring(r.species))
         end
-        mod.log:info("overworldmons: NPC-mon reskin patched %d/%d sprites",
-          patched, patched + skipped)
+        local def = spriteDefFor(mod, "OWM_OWMON_", dex, "land", nil, r.shiny)
+        if not def then error("spriteDefFor returned nil") end
+        world.sprites[spriteId] = def
+      end)
+      if applyOk then
+        patched = patched + 1
+      else
+        skipped = skipped + 1
+        mod.log:warn("overworldmons: NPC-mon reskin skipped " .. spriteId
+          .. " (" .. tostring(r.species) .. "): " .. tostring(applyErr))
       end
     end
-    return next_(game, dt)
-  end)
+    mod.log:info("overworldmons: NPC-mon reskin patched %d/%d sprites",
+      patched, patched + skipped)
+  end
+  return tickOverworldReskin
 end
 
 -- Per-object reskins (shared vanilla sprite records rule out a per-sprite patch);
@@ -1456,7 +1584,9 @@ local OBJECT_OVERRIDES = {
   { mapId = "OLIVINE_LIGHTHOUSE_6F", index = 2, species = "AMPHAROS",
     label = "Olivine Lighthouse Ampharos" },
   { mapId = "MAHOGANY_MART_1F", index = 4, species = "DRAGONITE",
-    label = "Mahogany Mart Dragonite" },
+    label = "Mahogany Mart Dragonite" },  -- Lance's Dragonite cameo (Team Rocket Base trap floor) was never added in vanilla.
+  { mapId = "TEAM_ROCKET_BASE_B2F", index = 4, species = "DRAGONITE",
+    label = "Team Rocket Base B2F Lance's Dragonite" },
   { mapId = "ROUTE_30", index = 6, species = "RATTATA",
     label = "Route 30 battling Rattata (1)" },
   { mapId = "ROUTE_30", index = 7, species = "RATTATA",
@@ -1468,14 +1598,9 @@ local OBJECT_OVERRIDES = {
   { mapId = "MOUNT_MOON_SQUARE", index = 1, species = "CLEFAIRY",
     label = "Mt Moon Square Clefairy" },
 
-  -- Found by cross-checking every RESKIN-table sprite's map object against
-  -- the real "cry" op in its own talk script (data/generated/scripts.lua):
-  -- each of these borrows one of the RESKIN table's shared generic sprites
-  -- but its own script plays a *different* species' cry, so the blanket
-  -- reskin painted the wrong Pokemon in. (Excluded: Team Rocket Base B2F's
-  -- three SPRITE_VOLTORB objects, whose cry/loadwildmon both say ELECTRODE
-  -- -- that mismatch is the vanilla "spot the fake Voltorb" puzzle, not a
-  -- reuse accident, so it's left alone.)
+  -- These borrow a shared generic sprite but play a different cry than their
+  -- talk script's species. (The Team Rocket Base B2F Voltorb/Electrode
+  -- mismatch is the vanilla puzzle, left alone.)
   { mapId = "BLACKTHORN_DRAGON_SPEECH_HOUSE", index = 2, species = "DRATINI",
     label = "Blackthorn Dragon Speech House Dratini" },
   { mapId = "CELADON_CITY", index = 2, species = "POLIWRATH",
@@ -1518,6 +1643,11 @@ local OBJECT_OVERRIDES = {
     label = "Viridian Speech House Spearow" },
   { mapId = "VIRIDIAN_NICKNAME_SPEECH_HOUSE", index = 4, species = "RATTATA",
     label = "Viridian Speech House Rattata" },
+
+  -- Its talk script has no cry op (unlike the others above), so the
+  -- cry-based audit missed it; confirmed species from its own text instead.
+  { mapId = "TEAM_ROCKET_BASE_B3F", index = 3, species = "MURKROW",
+    label = "Team Rocket Base B3F password Murkrow" },
 }
 
 local function setupObjectOverrides(mod)
@@ -1542,48 +1672,94 @@ local function setupObjectOverrides(mod)
     return
   end
 
+  -- Returns "ok", "retry" (object not live yet, e.g. a masked scripted
+  -- actor), or "error" (not worth retrying).
+  local function attemptApply(o)
+    if not o.def then
+      local okDef, errDef = pcall(function()
+        local rec = mod.content.pokemon:get(o.species)
+        local dex = rec and rec.dex
+        if type(dex) ~= "number" or dex < 1 or dex > MAX_DEX then
+          error("no dex for " .. tostring(o.species))
+        end
+        o.def = spriteDefFor(mod, "OWM_OWMON_", dex, "land", nil, o.shiny)
+        if not o.def then error("spriteDefFor returned nil") end
+      end)
+      if not okDef then return "error", errDef end
+    end
+    local h = mod.world:npc(o.mapId, o.index)
+    if not (h and h.npc and h.npc.setSpriteDef) then
+      return "retry", "no live npc at " .. o.mapId .. " index " .. o.index
+    end
+    local okSet, errSet = pcall(function()
+      h.npc:setSpriteDef(o.def)
+      local world = mod.game and mod.game.world
+      if world and world.applySpritePalette then world:applySpritePalette(h.npc) end
+    end)
+    if not okSet then return "error", errSet end
+    return "ok"
+  end
+
+  local activeMapId
+  local pending = {}
+
   mod.events:on("map.entered", function(ev)
     local mapId = ev and ev.mapId
     if not mapId then return end
+    activeMapId = mapId
+    pending = {}
     for _, o in ipairs(OBJECT_OVERRIDES) do
       if o.mapId == mapId then
-        local applyOk, applyErr = pcall(function()
-          if not o.def then
-            local rec = mod.content.pokemon:get(o.species)
-            local dex = rec and rec.dex
-            if type(dex) ~= "number" or dex < 1 or dex > MAX_DEX then
-              error("no dex for " .. tostring(o.species))
-            end
-            o.def = spriteDefFor(mod, "OWM_OWMON_", dex, "land", nil, o.shiny)
-            if not o.def then error("spriteDefFor returned nil") end
-          end
-          local h = mod.world:npc(o.mapId, o.index)
-          if not (h and h.npc and h.npc.setSpriteDef) then
-            error("no live npc at " .. o.mapId .. " index " .. o.index)
-          end
-          h.npc:setSpriteDef(o.def)
-          local world = mod.game and mod.game.world
-          if world and world.applySpritePalette then world:applySpritePalette(h.npc) end
-        end)
-        if applyOk then
+        local status, applyErr = attemptApply(o)
+        if status == "ok" then
           mod.log:info("overworldmons: %s reskinned", o.label)
+        elseif status == "retry" then
+          pending[#pending + 1] = o
         else
           mod.log:warn("overworldmons: %s override failed: %s", o.label, tostring(applyErr))
         end
       end
     end
   end)
+
+  local function tickObjectOverrides(game, dt)
+    if #pending == 0 then return end
+    local world = mod.game and mod.game.world
+    if not (world and world.map and world.map.id == activeMapId) then
+      pending = {}
+      return
+    end
+    local stillPending = {}
+    for _, o in ipairs(pending) do
+      local status, applyErr = attemptApply(o)
+      if status == "ok" then
+        mod.log:info("overworldmons: %s reskinned", o.label)
+      elseif status == "retry" then
+        stillPending[#stillPending + 1] = o
+      else
+        mod.log:warn("overworldmons: %s override failed: %s", o.label, tostring(applyErr))
+      end
+    end
+    pending = stillPending
+  end
+  return tickObjectOverrides
 end
 
 local RESKIN_ID_PREFIX = "OWM_OWMON_"
+local DAYCARE_ID_PREFIX = "OWM_DAYCARE_"
 
-local function setupReskinBounceFix(mod)
+-- These MOVE.POKEMON "scenery" objects are hardcoded FIXED_FACING by the
+-- engine and re-seeded on every rebuildPeople, so this re-clears it (and
+-- bouncing) on every map.entered. See setupReskinFacePlayer for the actual
+-- facing fix (clearing the flag alone isn't enough).
+local function setupReskinNpcFixups(mod)
   local function scrub(world)
     if not (world and world.npcs) then return end
     for _, npc in ipairs(world.npcs) do
-      if npc.bouncing and npc.spriteDef and type(npc.spriteDef.id) == "string"
+      if npc.spriteDef and type(npc.spriteDef.id) == "string"
           and npc.spriteDef.id:find(RESKIN_ID_PREFIX, 1, true) == 1 then
-        npc.bouncing = false
+        if npc.bouncing then npc.bouncing = false end
+        if npc.fixedFacing then npc.fixedFacing = false end
       end
     end
   end
@@ -1592,14 +1768,29 @@ local function setupReskinBounceFix(mod)
   end)
 end
 
--- World.lua's SPRITE.DAY_CARE_MON_1/2 (src/world/gen2/World.lua:176-177) --
--- the two reserved sprite ids above the normal SPRITE.VARS range that the
--- man/lady yard objects carry in their own map-object def (obj.sprite), on
--- whichever map they're placed. Native resolveSprite only ever pools the
--- object once a mon is actually deposited (an empty slot answers nil and
--- pooledNpc spawns nothing), so scanning world.npcs for these two raw ids is
--- exactly "is a bred mon currently standing in the yard" with no need to
--- know the map or object index ourselves.
+-- Vanilla scripts behind reskinned NPC-mons never call faceplayer, so this
+-- calls NPC:facePlayer directly on interact, before the script's textbox opens.
+local function setupReskinFacePlayer(mod)
+  mod.events:on("world.interacted", function(ev)
+    if not (ev and ev.kind == "npc" and ev.target) then return end
+    local npc = ev.target
+    local id = npc.spriteDef and npc.spriteDef.id
+    if type(id) ~= "string" then return end
+    if id:find(RESKIN_ID_PREFIX, 1, true) ~= 1
+        and id:find(DAYCARE_ID_PREFIX, 1, true) ~= 1 then
+      return
+    end
+    local world = mod.game and mod.game.world
+    if npc.facePlayer and world and world.player then
+      npc.fixedFacing = false
+      npc:facePlayer(world.player)
+    end
+  end)
+end
+
+-- World.lua's SPRITE.DAY_CARE_MON_1/2: the yard objects' reserved sprite ids.
+-- Scanning world.npcs for these means "a bred mon is in the yard", without
+-- needing to know the map/object index ourselves.
 local DAY_CARE_MON_1, DAY_CARE_MON_2 = 0xe0, 0xe1
 local DAYCARE_MAN_SPRITE, DAYCARE_LADY_SPRITE = "OWM_DAYCARE_MAN", "OWM_DAYCARE_LADY"
 
@@ -1624,19 +1815,14 @@ local function setupDaycareReskin(mod)
     end
   end
 
-  local defs = {}
   local function defFor(dex, shiny)
-    local key = dex .. (shiny and "S" or "")
-    if defs[key] == nil then
-      defs[key] = spriteDefFor(mod, "OWM_DAYCARE_", dex, "land", nil, shiny) or false
-    end
-    return defs[key] or nil
+    return spriteDefFor(mod, "OWM_DAYCARE_", dex, "land", nil, shiny)
   end
 
-  -- Native icon def carries no `.dvs`, so shininess is read straight off the
-  -- deposited party-mon record (save.dayCare.man/lady.mon) the same way
-  -- resolveSprite reaches it, rather than trying to smuggle it through
-  -- World:breedmonSpriteDef's species-only signature.
+  -- Shininess read from the deposited party mon (save.dayCare.man/lady.mon)
+  -- directly, since the native icon def carries no `.dvs`. Guarded per slot
+  -- by npc/dex/shiny so nothing rebuilds while a mon just sits in the yard.
+  local daycareLast = { man = {}, lady = {} }
   local function reskinSlot(world, npc, which)
     local save = mod.game and mod.game.save
     local dc = save and save.dayCare
@@ -1648,24 +1834,29 @@ local function setupDaycareReskin(mod)
     if not (type(dex) == "number" and dex >= 1 and dex <= MAX_DEX) then return end
     local shiny = Mon and mon.dvs
       and Mon.isShiny(mon.dvs, { species = mon.species, level = mon.level })
-    local def = defFor(dex, shiny)
-    if not def then return end
-    if npc.setSpriteDef and npc:setSpriteDef(def) then
-      if world.applySpritePalette then world:applySpritePalette(npc) end
+    local last = daycareLast[which]
+    if last.npc ~= npc or last.dex ~= dex or last.shiny ~= shiny then
+      local def = defFor(dex, shiny)
+      if def and npc.setSpriteDef and npc:setSpriteDef(def) then
+        if world.applySpritePalette then world:applySpritePalette(npc) end
+      end
+      last.npc, last.dex, last.shiny = npc, dex, shiny
     end
-    -- The native yard object's own movement is MOVE.POKEMON (a two-frame
-    -- hop/flip in place -- NPC:bounceFrame overrides the normal walk-cycle
-    -- frame whenever `bouncing` is set, engine/overworld/map_object_action.asm
-    -- OBJECT_ACTION_BOUNCE), which setSpriteDef never touches. Left alone the
-    -- walking sheet plays under that bounce override and just flips between
-    -- two of its frames instead of animating -- same fix setupReskinBounceFix
-    -- applies to the other per-object reskins, done here every tick (not just
-    -- on map.entered) since this object's def can change mid-visit.
+    -- Clear the native MOVE.POKEMON bounce/fixedFacing override every tick
+    -- (this object's def can change mid-visit; setupReskinNpcFixups doesn't
+    -- reach the OWM_DAYCARE_ prefix).
     npc.bouncing = false
+    npc.fixedFacing = false
   end
 
-  mod.hooks:wrap("input.step", function(next_, game, dt)
-    next_(game, dt)
+  -- Throttled: scans every NPC on the active map (no map-id shortcut for
+  -- the yard objects), for a state that only changes on a rare menu action.
+  local daycareClock = 0
+  local DAYCARE_RESKIN_INTERVAL = 0.25
+  local function tickDaycare(game, dt)
+    daycareClock = daycareClock + (dt or 0)
+    if daycareClock < DAYCARE_RESKIN_INTERVAL then return end
+    daycareClock = daycareClock % DAYCARE_RESKIN_INTERVAL
     local world = game and game.world
     if not (world and world.npcs) then return end
     for _, npc in ipairs(world.npcs) do
@@ -1674,27 +1865,15 @@ local function setupDaycareReskin(mod)
         reskinSlot(world, npc, s == DAY_CARE_MON_1 and "man" or "lady")
       end
     end
-  end)
+  end
 
   mod.log:info("overworldmons: day-care mon reskin armed")
+  return tickDaycare
 end
 
--- The battle-HUD shiny glyph: a 3-sparkle tile Red++ added to its own font
--- for the same purpose. Registered as our own font page/charmap entry
--- (rather than assuming the base ROM's font already has it) so it draws
--- through the normal glyph pipeline anywhere Font.draw is called.
---
--- The code must sit well clear of $100-$3FF: that's exactly the block a
--- translation's own extra font page claims for accented/extended Latin and
--- kana glyphs (src/render/Font.lua's own comment: "a kana block at $100").
--- $101 collided with a PT-BR page there -- pageFor() sorts pages by base
--- descending and returns the first whose base <= code, so any accented
--- code >= $101 (Ã, Á, ...) resolved to our 1-glyph shiny page instead of
--- the translation's, and our page has no quad for that offset, so it drew
--- nothing: NÃO -> "N O", RÁDIO -> "R DIO". Parking the code just under
--- Font.TTF_BASE keeps it above every plausible tile-page base (translations
--- top out nowhere near this high) while still staying below TTF_BASE so it
--- is never mistaken for a TTF codepoint.
+-- Battle-HUD shiny glyph, registered as our own font page/charmap entry.
+-- Code must avoid $100-$3FF (translation font pages' accented/kana block,
+-- e.g. $101 broke PT-BR accents); parked just under Font.TTF_BASE instead.
 local SHINY_GLYPH_SEQ = "<SHINY>"
 local SHINY_GLYPH_CODE = 0x3F0000
 
@@ -1713,17 +1892,9 @@ local function setupWild(mod, Chain, Roamers)
       { seq = SHINY_GLYPH_SEQ, code = SHINY_GLYPH_CODE })
   end
 
-  -- A content mod that ships its own small encounters.* subset (e.g. Kanto-
-  -- Reforged's restored-dungeon maps) can create data.encounters before we
-  -- run, which used to make us skip aliasing gen2Encounters in altogether --
-  -- every ordinary route then read as "no grass/water encounter table" and
-  -- spawned nothing. Back-fill per [kind][mapId] slot instead of gating on
-  -- "encounters == nil": anything already present (ours or another mod's) is
-  -- left alone, only genuinely missing map ids get the vanilla table.
-  -- Only "grass"/"water" -- the two kinds WorldAPI:effectiveEncounters reads
-  -- (src/world/gen2/WorldAPI.lua ENCOUNTER_TERRAIN) -- gen2Encounters' other
-  -- top-level keys (bugContest, trees, roamMons, source, ...) are differently
-  -- shaped (arrays/strings, not [mapId] dicts) and not ours to merge.
+  -- Back-fill data.encounters[kind][mapId] from gen2Encounters, per-slot
+  -- (not gated on "encounters == nil"), so another mod pre-creating
+  -- data.encounters doesn't zero out every ordinary route's wild table.
   local ENCOUNTER_KINDS = { "grass", "water" }
   local encounterAliasDone = false
   local function ensureEncounterAlias()
@@ -1750,14 +1921,8 @@ local function setupWild(mod, Chain, Roamers)
   end
   ensureEncounterAlias()
 
-  local defCache = { land = {}, water = {} }
   local function defFor(dex, terrain, form, shiny)
-    local cache = defCache[terrain]
-    local key = (form and (dex .. form) or dex) .. (shiny and "S" or "")
-    if not cache[key] then
-      cache[key] = spriteDefFor(mod, "OWM_WILD_SHEET_", dex, terrain, form, shiny)
-    end
-    return cache[key]
+    return spriteDefFor(mod, "OWM_WILD_SHEET_", dex, terrain, form, shiny)
   end
   local function spriteId(slot) return "OWM_WILD_" .. slot end
   local function sparkleSpriteId(slot) return "OWM_SPARKLE_" .. slot end
@@ -1783,30 +1948,33 @@ local function setupWild(mod, Chain, Roamers)
   end
 
   local function rng()
-    return (love and love.math and love.math.random) or math.random
+    return (love and love.math and love.math.random) or random
   end
 
   local NEIGH = {
     { 1, 0, "right" }, { -1, 0, "left" }, { 0, 1, "down" }, { 0, -1, "up" },
   }
   local function cheb(ax, ay, bx, by)
-    local dx, dy = math.abs(ax - bx), math.abs(ay - by)
+    local dx, dy = abs(ax - bx), abs(ay - by)
     return dx > dy and dx or dy
+  end
+
+  -- Hoisted out of visibleCellRadius so pcall isn't handed a fresh closure each call.
+  local function computeVisibleCellRadius()
+    local ww, wh = love.graphics.getDimensions()
+    local S = ZoomMod.windowFitScale()
+    local s = ZoomMod.scale(S)
+    local vw, vh = ZoomMod.fillViewSize(s, ww, wh)
+    local halfW = floor((vw / 16) / 2)
+    local halfH = floor((vh / 16) / 2)
+    return max(1, min(halfW, halfH))
   end
 
   local function visibleCellRadius()
     if not (ZoomMod and love and love.graphics and love.graphics.getDimensions) then
       return FALLBACK_VIEW_RADIUS
     end
-    local ok, radius = pcall(function()
-      local ww, wh = love.graphics.getDimensions()
-      local S = ZoomMod.windowFitScale()
-      local s = ZoomMod.scale(S)
-      local vw, vh = ZoomMod.fillViewSize(s, ww, wh)
-      local halfW = math.floor((vw / 16) / 2)
-      local halfH = math.floor((vh / 16) / 2)
-      return math.max(1, math.min(halfW, halfH))
-    end)
+    local ok, radius = pcall(computeVisibleCellRadius)
     return (ok and type(radius) == "number") and radius or FALLBACK_VIEW_RADIUS
   end
 
@@ -1819,7 +1987,7 @@ local function setupWild(mod, Chain, Roamers)
 
   local function densityCap(placementRadius)
     local diameter = 2 * placementRadius + 1
-    local cap = math.floor((diameter * diameter) / CELLS_PER)
+    local cap = floor((diameter * diameter) / CELLS_PER)
     if cap < MIN_DENSITY_CAP then cap = MIN_DENSITY_CAP end
     if cap > MAX_DENSITY_CAP then cap = MAX_DENSITY_CAP end
     return cap
@@ -1838,22 +2006,13 @@ local function setupWild(mod, Chain, Roamers)
 
   local function isFillerCell(map, cx, cy)
     if not (map and map.blockId) then return false end
-    return map:blockId(math.floor(cx / 2), math.floor(cy / 2))
+    return map:blockId(floor(cx / 2), floor(cy / 2))
       == (map.borderBlock or 0)
   end
 
-  -- Gold's own CheckGrassCollision (the routine that actually rolls a wild
-  -- encounter on a step) reads a WIDER collision set than Permissions.isGrass
-  -- does (src/world/gen2/Permissions.lua's own comment spells this out:
-  -- "NOT the same list as GRASS above, and the difference is load bearing").
-  -- COLL_GRASS_48..4C ($48-$4c) is real cart-verbatim encounter terrain that
-  -- isGrass never recognizes -- confirmed 2026-09-15 against a real Route 13
-  -- report: a wide, visually distinct pale patch triggers native encounters
-  -- immediately, but a first (and second) attempt at this fix (v0.17.4
-  -- unmodified, then v0.17.6) both gated spawns to isGrassCell alone and
-  -- missed it entirely. `map:cellTile` (Gen2Compat's exposed alias for the
-  -- raw COLL_* byte, despite the Gen-1-flavored name) is what a mod has to
-  -- reach for this, since isGrassCell can't see it.
+  -- Native CheckGrassCollision reads a wider collision set than
+  -- isGrassCell exposes; COLL_GRASS_48..4C is real encounter terrain
+  -- isGrassCell misses, only visible via map:cellTile's raw byte.
   local EXTRA_GRASS_COLL = {
     [0x48] = true, [0x49] = true, [0x4a] = true, [0x4b] = true, [0x4c] = true,
   }
@@ -1864,6 +2023,36 @@ local function setupWild(mod, Chain, Roamers)
       if coll and EXTRA_GRASS_COLL[coll % 256] then return true end
     end
     return false
+  end
+
+  -- Ice forces a slide; a wanderer can't stand/spawn on it. isIce's
+  -- collision ids aren't exposed as a map method, so inlined here.
+  local ICE_COLL = { [0x23] = true, [0x2b] = true }
+  local function isIceCell(map, cx, cy)
+    if map.cellTile then
+      local coll = map:cellTile(cx, cy)
+      if coll and ICE_COLL[coll % 256] then return true end
+    end
+    return false
+  end
+
+  -- A tile next to ice is where a slide comes to rest, so a wanderer there
+  -- would block it, same as standing on the ice itself. Memoized per cell
+  -- for the map visit: this runs on every wanderer's every move attempt,
+  -- and map:cellTile crosses the Lua/engine boundary.
+  local iceHazardCache = {}
+  local function isIceHazardCell(map, cx, cy)
+    local k = cy * 1024 + cx
+    local cached = iceHazardCache[k]
+    if cached ~= nil then return cached end
+    local hazard = isIceCell(map, cx, cy)
+    if not hazard then
+      for _, d in ipairs(NEIGH) do
+        if isIceCell(map, cx + d[1], cy + d[2]) then hazard = true; break end
+      end
+    end
+    iceHazardCache[k] = hazard
+    return hazard
   end
 
   -- Keeps solid wild mons off the shore (would block a 1-tile crossing).
@@ -1901,22 +2090,27 @@ local function setupWild(mod, Chain, Roamers)
       local c = kindAt(x, y)
       return c == "." or c == "+"
     end
+    -- Stacks hold packed y*1024+x integers to avoid GC churn from a fresh
+    -- table per push/pop; only the result lists hold {x,y} tables.
     local stack, seen, shore = {}, {}, {}
     if walk(pcx, pcy) then
-      stack[1] = { pcx, pcy }; seen[pcy * 1024 + pcx] = true
+      stack[1] = pcy * 1024 + pcx; seen[pcy * 1024 + pcx] = true
     elseif kindAt(pcx, pcy) == "~" then
       seen[pcy * 1024 + pcx] = true
       shore[pcy * 1024 + pcx] = { pcx, pcy }
     end
     while #stack > 0 do
-      local cell = stack[#stack]; stack[#stack] = nil
-      if kindAt(cell[1], cell[2]) == "." then land[#land + 1] = cell end
+      local k = stack[#stack]; stack[#stack] = nil
+      local cx, cy = k % 1024, floor(k / 1024)
+      if kindAt(cx, cy) == "." and not isIceHazardCell(map, cx, cy) then
+        land[#land + 1] = { cx, cy }
+      end
       for _, d in ipairs(NEIGH) do
-        local nx, ny = cell[1] + d[1], cell[2] + d[2]
+        local nx, ny = cx + d[1], cy + d[2]
         local nk = ny * 1024 + nx
-        if not seen[nk] and crossable(map, cell[1], cell[2], d[3]) then
+        if not seen[nk] and crossable(map, cx, cy, d[3]) then
           if walk(nx, ny) then
-            seen[nk] = true; stack[#stack + 1] = { nx, ny }
+            seen[nk] = true; stack[#stack + 1] = nk
           elseif kindAt(nx, ny) == "~" then
             shore[nk] = { nx, ny }
           end
@@ -1924,26 +2118,26 @@ local function setupWild(mod, Chain, Roamers)
       end
     end
     local wstack, wseen = {}, {}
-    for k, cell in pairs(shore) do wstack[#wstack + 1] = cell; wseen[k] = true end
+    for k in pairs(shore) do wstack[#wstack + 1] = k; wseen[k] = true end
     while #wstack > 0 do
-      local cell = wstack[#wstack]; wstack[#wstack] = nil
-      water[#water + 1] = cell
+      local k = wstack[#wstack]; wstack[#wstack] = nil
+      local cx, cy = k % 1024, floor(k / 1024)
+      water[#water + 1] = { cx, cy }
       for _, d in ipairs(NEIGH) do
-        local nx, ny = cell[1] + d[1], cell[2] + d[2]
+        local nx, ny = cx + d[1], cy + d[2]
         local nk = ny * 1024 + nx
         if not wseen[nk] and kindAt(nx, ny) == "~"
-            and crossable(map, cell[1], cell[2], d[3]) then
-          wseen[nk] = true; wstack[#wstack + 1] = { nx, ny }
+            and crossable(map, cx, cy, d[3]) then
+          wseen[nk] = true; wstack[#wstack + 1] = nk
         end
       end
     end
     return land, water
   end
 
-  -- Groups a flat cell list into contiguous 4-neighbor patches (BUGS.md #16/#18:
-  -- treat every encounter patch on equal footing instead of one pool weighted by
-  -- raw candidate count, which let one big water body or grass field starve
-  -- smaller patches nearby).
+  -- Groups a flat cell list into contiguous 4-neighbor patches, so every
+  -- encounter patch gets equal footing instead of one pool weighted by
+  -- raw candidate count.
   local function labelPatches(cells)
     local index = {}
     for i, c in ipairs(cells) do index[c[2] * 1024 + c[1]] = i end
@@ -1952,17 +2146,19 @@ local function setupWild(mod, Chain, Roamers)
       local key = c[2] * 1024 + c[1]
       if not visited[key] then
         visited[key] = true
-        local patch, stack = {}, { c }
+        -- Packed-int stack; patch entries reuse cells[] references directly.
+        local patch, stack = {}, { key }
         while #stack > 0 do
-          local cell = stack[#stack]; stack[#stack] = nil
-          patch[#patch + 1] = cell
+          local k = stack[#stack]; stack[#stack] = nil
+          patch[#patch + 1] = cells[index[k]]
+          local cx, cy = k % 1024, floor(k / 1024)
           for _, d in ipairs(NEIGH) do
-            local nx, ny = cell[1] + d[1], cell[2] + d[2]
+            local nx, ny = cx + d[1], cy + d[2]
             local nk = ny * 1024 + nx
             local ni = index[nk]
             if ni and not visited[nk] then
               visited[nk] = true
-              stack[#stack + 1] = cells[ni]
+              stack[#stack + 1] = nk
             end
           end
         end
@@ -1972,13 +2168,12 @@ local function setupWild(mod, Chain, Roamers)
     return patches
   end
 
-  -- BUGS.md #18's own pitch: a 4+ tile patch floors at 2, +1 per additional 4
-  -- tiles. Extended down to a floor of 1 for 1-3 tile patches so a tiny patch
-  -- is never silently starved outright.
+  -- A 4+ tile patch floors at 2, +1 per additional 4 tiles; 1-3 tile
+  -- patches floor at 1 so none are starved outright.
   local function patchQuota(size)
     if size <= 0 then return 0 end
     if size < 4 then return 1 end
-    return 2 + math.floor((size - 4) / 4)
+    return 2 + floor((size - 4) / 4)
   end
 
   -- Largest-remainder proportional trim: when total quota demand exceeds what
@@ -1997,7 +2192,7 @@ local function setupWild(mod, Chain, Roamers)
     local sumFloors = 0
     for _, a in ipairs(allocs) do
       local exact = a.quota * need / totalQuota
-      a.alloc = math.floor(exact)
+      a.alloc = floor(exact)
       a.remainder = exact - a.alloc
       sumFloors = sumFloors + a.alloc
     end
@@ -2083,7 +2278,7 @@ local function setupWild(mod, Chain, Roamers)
     if not next(dist) then return nil, nil end
     local levels = {}
     for species, wt in pairs(levelWt) do
-      levels[species] = math.floor(levelSum[species] / wt + 0.5)
+      levels[species] = floor(levelSum[species] / wt + 0.5)
     end
     return dist, levels
   end
@@ -2124,7 +2319,7 @@ local function setupWild(mod, Chain, Roamers)
         if type(list) == "table" then scan(list) end
       end
     end
-    if n > 0 then return math.floor(sum / n + 0.5) end
+    if n > 0 then return floor(sum / n + 0.5) end
     return any or 5
   end
 
@@ -2133,6 +2328,7 @@ local function setupWild(mod, Chain, Roamers)
   local activeMapId
   local grassDist, waterDist
   local regionLand, regionWater, regionEligible, regionTotalQuota
+  local regionGrassLand -- regionLand filtered through isEncounterGrassCell; cached alongside it, see needFlood below
   local regionFloodAtX, regionFloodAtY
   local stepTick = 0
   local topUpClock = 0
@@ -2174,21 +2370,34 @@ local function setupWild(mod, Chain, Roamers)
     return n
   end
 
+  -- `live` is an unordered pool (every caller either scans it fully or
+  -- indexes it by npcId via liveById), so a swap-and-pop is a correct O(1)
+  -- replacement for table.remove's O(n) downward shift. Safe with every
+  -- call site here: they either iterate `live` backwards (the swapped-in
+  -- tail element lands on an already-visited index) or remove a single
+  -- entry found by a completed scan, never a live forward iteration.
   local function removeWanderer(i)
     local w = live[i]
-    if w and w.npcId then mod.world:removeNpc(w.npcId) end
-    if w and w.sparkleNpcId then mod.world:removeNpc(w.sparkleNpcId) end
-    if w and w.npcId then liveById[w.npcId] = nil end
-    table.remove(live, i)
+    if not w then return end
+    if w.npcId then
+      mod.world:removeNpc(w.npcId)
+      liveById[w.npcId] = nil
+    end
+    if w.sparkleNpcId then mod.world:removeNpc(w.sparkleNpcId) end
+    local n = #live
+    live[i] = live[n]
+    live[n] = nil
   end
 
   local function despawnAll()
     for i = #live, 1, -1 do removeWanderer(i) end
   end
 
+  -- w.npcRef is the real engine npc table, captured once at spawn time
+  -- (see followerNpcRef above) rather than re-resolved via mod.world:npc.
   local function npcCell(w)
-    local h = w.index and mod.world:npc(activeMapId, w.index)
-    if h and h.npc then return h.npc.cellX, h.npc.cellY, h.npc end
+    local npc = w.npcRef
+    if npc then return npc.cellX, npc.cellY, npc end
     return nil
   end
 
@@ -2207,9 +2416,8 @@ local function setupWild(mod, Chain, Roamers)
     return INCENSE_DENSITY[incenseMode] or 1.0
   end
 
-  -- OFF and REPEL both mean "our own wanderer pool stays empty"; REPEL
-  -- additionally leans on the engine's real repel gate (see INCENSE_REPEL_STEPS
-  -- above) so the vanilla encounters OFF re-enables never actually land either.
+  -- OFF and REPEL both keep our wanderer pool empty; REPEL also leans on
+  -- the engine's real repel gate so vanilla encounters stay blocked too.
   local function incenseSpawningOff()
     return incenseMode == "off" or incenseMode == "repel"
   end
@@ -2298,10 +2506,8 @@ local function setupWild(mod, Chain, Roamers)
         dvs = Mon.randomDVs(); dvs.hp = Mon.hpDV(dvs)
         shiny = Mon.isShiny(dvs, { species = species, level = level })
       end
-      -- Cap concurrent shinies on screen: a hit past the cap re-rolls plain
-      -- DVs rather than keeping the shiny-pattern/DV-floor spread unshiny,
-      -- since that spread (defense/speed/special=10, or K stats forced to
-      -- 15) reads as suspiciously good on a mon that isn't actually shiny.
+      -- Cap concurrent shinies: past the cap, re-roll plain DVs rather than
+      -- keeping a shiny-pattern DV spread on a mon that isn't shiny.
       if shiny and liveShinyCount() >= MAX_LIVE_SHINIES then
         shiny = false
         dvs = Mon.randomDVs(); dvs.hp = Mon.hpDV(dvs)
@@ -2310,7 +2516,7 @@ local function setupWild(mod, Chain, Roamers)
     local form
     if dex == UNOWN_DEX and Unown then
       form = dvs and Unown.name(Unown.letterFromDVs(dvs))
-        or Unown.name(math.floor(r() * Unown.NUM_UNOWN) + 1)
+        or Unown.name(floor(r() * Unown.NUM_UNOWN) + 1)
     end
     local def = defFor(dex, terrain, form, shiny)
 
@@ -2332,7 +2538,7 @@ local function setupWild(mod, Chain, Roamers)
     end
 
     local entry = {
-      npcId = npcId, index = index, slot = slot,
+      npcId = npcId, index = index, npcRef = h and h.npc, slot = slot,
       species = species, level = level, terrain = terrain, dvs = dvs,
       shiny = shiny,
     }
@@ -2362,7 +2568,13 @@ local function setupWild(mod, Chain, Roamers)
           end
           entry.sparkleNpcId, entry.sparkleIndex, entry.sparkleSlot =
             sNpcId, sIndex, sSlot
-          entry.sparkleClock = 0
+          entry.sparkleNpcRef = sh and sh.npc
+          entry.sparkleClock, entry.sparkleFrame = 0, 0
+          -- Installed once: bounceFrame reads entry.sparkleFrame via upvalue,
+          -- so the sync loop below only writes a number, no new closure.
+          if entry.sparkleNpcRef then
+            entry.sparkleNpcRef.bounceFrame = function() return entry.sparkleFrame end
+          end
         end
       end
     end
@@ -2374,7 +2586,9 @@ local function setupWild(mod, Chain, Roamers)
     grassDist, waterDist, activeMapId = nil, nil, nil
     fishLevels = nil
     regionLand, regionWater, regionEligible, regionTotalQuota = nil, nil, nil, nil
+    regionGrassLand = nil
     regionFloodAtX, regionFloodAtY = nil, nil
+    iceHazardCache = {}
     if not mapId then return false end
     grassDist = eligibleDist(mapId, "grass")
     waterDist = eligibleDist(mapId, "water")
@@ -2475,7 +2689,7 @@ local function setupWild(mod, Chain, Roamers)
     end
 
     local entry = {
-      npcId = npcId, index = npcIndex, slot = rslot,
+      npcId = npcId, index = npcIndex, npcRef = h and h.npc, slot = rslot,
       species = species, level = level, terrain = terrain,
       dvs = slot.dvs, shiny = shiny,
       roamer = true, roamerIndex = index,
@@ -2515,7 +2729,7 @@ local function setupWild(mod, Chain, Roamers)
           candidates[#candidates + 1] = e
         end
         if #candidates > 0 then
-          local pick = candidates[math.floor(r() * #candidates) + 1]
+          local pick = candidates[floor(r() * #candidates) + 1]
           local c, terrain = pick[1], pick[2]
           spawnRoamer(index, slot, c, terrain, pcx, pcy)
           taken[c[2] * 1024 + c[1]] = true
@@ -2532,29 +2746,34 @@ local function setupWild(mod, Chain, Roamers)
 
     local viewRadius, placementRadius, despawnRadius = windowRadii()
 
-    -- Self-healing re-flood: if the flood computed from the player's entry
-    -- cell (or wherever they were standing on the last attempt) ends up
-    -- having nothing SPAWNABLE in it -- confirmed on a real Route 35 entry
-    -- from Route 36: the player lands in a small, real, walkable alcove
-    -- (localRegion finds it fine) that simply has no grass tiles in it at
-    -- all -- the OLD code cached that dead-end result for the rest of the
-    -- map visit and never tried again, so spawns stayed stuck at zero even
-    -- after the player walked elsewhere on the same map. Now: a flood that
-    -- comes up empty of spawnable land/water only "sticks" for the exact
-    -- cell it was computed from; any actual player movement re-attempts it
-    -- from the new position, bounded by real movement rather than the
-    -- periodic topUpClock tick (so it can't cost a fresh BFS every second
-    -- while the player is stationary in a genuinely grass/water-free spot
-    -- like a town).
+    -- Self-healing re-flood: an empty-of-spawnable-land/water result only
+    -- "sticks" for the exact cell it was computed from, so real player
+    -- movement re-attempts it instead of staying stuck at zero forever.
     local needFlood = not regionLand
       or (regionEligible == false and not (regionFloodAtX == pcx and regionFloodAtY == pcy))
     if needFlood then
       regionLand, regionWater = localRegion(map, pcx, pcy)
       regionFloodAtX, regionFloodAtY = pcx, pcy
+
+      -- Gate to isEncounterGrassCell, not isGrassCell alone (see that
+      -- helper). Filtered once per flood, not once per topUp call, since
+      -- the result only changes when regionLand does.
+      regionGrassLand = regionLand
+      if #regionLand > 0 and map.isGrassCell then
+        local g = {}
+        for _, c in ipairs(regionLand) do
+          if isEncounterGrassCell(map, c[1], c[2]) then g[#g + 1] = c end
+        end
+        if #g > 0 then
+          regionGrassLand = g
+        else
+          local env = map.def and map.def.environment
+          if env == "ROUTE" or env == "TOWN" then regionGrassLand = {} end
+        end
+      end
     end
-    local landRaw, water = regionLand or {}, regionWater or {}
-    local land = landRaw
-    if not grassDist then land = {} end
+    local water = regionWater or {}
+    local land = grassDist and (regionGrassLand or regionLand or {}) or {}
     if not waterDist then water = {} end
 
     local taken = {}
@@ -2577,54 +2796,18 @@ local function setupWild(mod, Chain, Roamers)
       end
     end
 
-    -- v0.17.7: gate to isEncounterGrassCell (isGrassCell + the COLL_GRASS_48
-    -- family), not isGrassCell alone -- see that helper's comment for why. A
-    -- v0.17.5 attempt at "fix the dead zone" fell back to ungated walkable
-    -- land instead, which was wrong for a different reason (reverted in
-    -- v0.17.6): dumps wanderers on genuinely non-encounter tiles. This is
-    -- the actual root cause both of those attempts missed.
-    if grassDist and #land > 0 and map.isGrassCell then
-      local g = {}
-      for _, c in ipairs(land) do
-        if isEncounterGrassCell(map, c[1], c[2]) then g[#g + 1] = c end
-      end
-      if #g > 0 then
-        land = g
-      else
-        local env = map.def and map.def.environment
-        if env == "ROUTE" or env == "TOWN" then land = {} end
-      end
-    end
-
     syncRoamers(map, pcx, pcy, land, water, taken, placementRadius)
 
     local eligible = #land + #water
     regionEligible = eligible > 0
-    -- REPEL: a real Repel doesn't stop a Gen 2 roamer either, so the sync
-    -- above still runs -- only the ordinary wanderer pool below is skipped.
-    -- This has to come AFTER regionEligible is set (not before it, like an
-    -- earlier version of this had it): topUp's own self-healing re-flood
-    -- (see the comment above needFlood) only re-attempts a dead-end flood
-    -- once regionEligible reads false, so skipping that assignment while
-    -- under REPEL left it stuck at its last real value forever -- on a map
-    -- entered into a genuinely grass-free alcove (the same Route 35-from-36
-    -- case that motivated the self-healing fix in the first place), that
-    -- meant land/water stayed empty and syncRoamers could never place a
-    -- roamer for the rest of the visit, even though it was really on the map.
+    -- REPEL only skips the ordinary wanderer pool below (roamer sync above
+    -- still runs); must come after regionEligible is set, or the
+    -- self-healing re-flood above gets stuck since it never reads false.
     if incenseMode == "repel" then return end
     if eligible == 0 then return end
 
-    -- `totalQuota` (the region's real carrying capacity) depends only on
-    -- `land`/`water` -- the whole-region habitat lists -- never on the
-    -- player's position or which cells are currently taken. So it's stable
-    -- for as long as regionLand/regionWater are (i.e. until the next
-    -- `needFlood`), and can be cached instead of recomputed via a full
-    -- patch-labeling BFS on every topUp tick (every ~1s). This matters even
-    -- once the wanderer pool is full (see below), AND when the habitat is
-    -- simply too small to ever fill the pool -- without this cache, a small
-    -- pocket of grass that tops out at e.g. 4 mons would still pay for the
-    -- full BFS forever, every tick, since `#live < POOL` never stops being
-    -- true. Was a real music-stutter source on weak hardware.
+    -- totalQuota depends only on land/water, not player position, so it's
+    -- cached until the next needFlood instead of a fresh BFS every tick.
     if needFlood then
       regionTotalQuota = 0
       for _, list in ipairs({ land, water }) do
@@ -2634,19 +2817,16 @@ local function setupWild(mod, Chain, Roamers)
       end
     end
 
-    local target = math.floor(
-      math.min(densityCap(placementRadius), regionTotalQuota or 0) * densityMultiplier())
+    local target = floor(
+      min(densityCap(placementRadius), regionTotalQuota or 0) * densityMultiplier())
     if target < 2 then target = 2 end
     local nearby = 0
     for _, w in ipairs(live) do
       local cx, cy = npcCell(w)
       if cx and cheb(cx, cy, pcx, pcy) <= despawnRadius then nearby = nearby + 1 end
     end
-    -- Cheap ceiling check using the cached quota above -- skips the
-    -- expensive per-tick BFS/shore-check pass below entirely once the area
-    -- is at capacity (whether that capacity is POOL or the habitat's own
-    -- smaller ceiling).
-    if math.min(target - nearby, POOL - #live) <= 0 then return end
+    -- Cheap ceiling check: skips the BFS/shore-check pass once at capacity.
+    if min(target - nearby, POOL - #live) <= 0 then return end
 
     local function windowFilter(list)
       local out = {}
@@ -2666,11 +2846,9 @@ local function setupWild(mod, Chain, Roamers)
     -- NOT the window-filtered candidate lists above -- the player-centered
     -- MIN_SPAWN_DIST exclusion and each live wanderer's MIN_WANDERER_SPACING
     -- ring otherwise chop one real contiguous field into several small
-    -- fragments, each capped at patchQuota's tiny per-fragment floor. That
-    -- undercounted badly on real routes (regression found on Route 37:
-    -- reported "only 2 Pokemon ever spawn"). Quota is computed from the real
-    -- patch; `windowFilter` is then only used to find which of that patch's
-    -- cells are actually placeable this pass.
+    -- fragments, each capped at patchQuota's tiny per-fragment floor. Quota
+    -- is computed from the real patch; `windowFilter` is then only used to
+    -- find which of that patch's cells are actually placeable this pass.
     local allocs = {}
     local visibleQuota = 0
     local function addPatches(list, kind)
@@ -2691,7 +2869,7 @@ local function setupWild(mod, Chain, Roamers)
     addPatches(land, "land")
     addPatches(water, "water")
 
-    local need = math.min(target - nearby, POOL - #live)
+    local need = min(target - nearby, POOL - #live)
     if need <= 0 then return end
 
     local r = rng()
@@ -2705,7 +2883,7 @@ local function setupWild(mod, Chain, Roamers)
 
     local function takeRandomFrom(list)
       if #list == 0 then return nil end
-      local i = math.floor(r() * #list) + 1
+      local i = floor(r() * #list) + 1
       local c = list[i]; list[i] = list[#list]; list[#list] = nil
       return c
     end
@@ -2758,7 +2936,9 @@ local function setupWild(mod, Chain, Roamers)
     grassDist, waterDist, activeMapId = nil, nil, nil
     fishLevels = nil
     regionLand, regionWater, regionEligible, regionTotalQuota = nil, nil, nil, nil
+    regionGrassLand = nil
     regionFloodAtX, regionFloodAtY = nil, nil
+    iceHazardCache = {}
   end)
 
   mod.events:on("roamer.moved", function(ev)
@@ -2797,9 +2977,7 @@ local function setupWild(mod, Chain, Roamers)
     end
   end)
 
-  mod.hooks:wrap("input.step", function(next_, game, dt)
-    next_(game, dt)
-
+  local function tickWildStep(game, dt)
     if activeMapId then
       tickDecay(dt or 0)
 
@@ -2815,27 +2993,21 @@ local function setupWild(mod, Chain, Roamers)
     end
 
     if activeMapId then
+      -- Cached refs (see npcCell) instead of two mod.world:npc() lookups
+      -- per live shiny, every frame.
       for _, w in ipairs(live) do
         if w.sparkleIndex then
-          local h = mod.world:npc(activeMapId, w.index)
-          local sh = mod.world:npc(activeMapId, w.sparkleIndex)
-          if h and h.npc and sh and sh.npc then
-            sh.npc.cellX, sh.npc.cellY = h.npc.cellX, h.npc.cellY
-            -- +1 world-pixel (imperceptible) on py only, never px: World:
-            -- drawPeople Y-sorts the draw list on this same py field via a
-            -- plain table.sort, which is not a stable sort, so two entries
-            -- at the exact same py (host and sparkle riding its cell) can
-            -- flip which one paints on top from frame to frame. Nudging the
-            -- sparkle strictly below the host's py breaks the tie the same
-            -- way every time -- a real ordering fix within the native
-            -- Y-sorted pipeline, not the old render.hud draw-over-everything.
-            local hostPy = h.npc.py
-            sh.npc.px, sh.npc.py = h.npc.px, hostPy and hostPy + 1 or hostPy
+          local npc, snpc = w.npcRef, w.sparkleNpcRef
+          if npc and snpc then
+            snpc.cellX, snpc.cellY = npc.cellX, npc.cellY
+            -- +1 py (imperceptible) breaks the non-stable table.sort tie
+            -- between host and sparkle at the same py in World:drawPeople.
+            local hostPy = npc.py
+            snpc.px, snpc.py = npc.px, hostPy and hostPy + 1 or hostPy
             w.sparkleClock = (w.sparkleClock or 0) + (dt or 0)
             local period = SPARKLE_FRAME_SECONDS * SPARKLE_FRAMES
             w.sparkleClock = w.sparkleClock % period
-            local frame = math.floor(w.sparkleClock / SPARKLE_FRAME_SECONDS) % SPARKLE_FRAMES
-            sh.npc.bounceFrame = function() return frame end
+            w.sparkleFrame = floor(w.sparkleClock / SPARKLE_FRAME_SECONDS) % SPARKLE_FRAMES
           end
         end
       end
@@ -2877,7 +3049,7 @@ local function setupWild(mod, Chain, Roamers)
     mod.world:queueScript({
       { "start_battle", "wild", battle.species, battle.level },
     })
-  end)
+  end
 
   mod.events:on("battle.started", function(ev)
     if ev and ev.kind == "wild" then
@@ -2910,18 +3082,12 @@ local function setupWild(mod, Chain, Roamers)
       dvs.hp, enemyMon.shiny and " SHINY" or "")
   end)
 
-  -- Enemy HUD's row-1 gap left of "<LV>" (tile 1,1 / pixel 8,8): blank in
-  -- the vanilla layout, per R39's own stand-in sparkle recipe. The hook's
-  -- payload is the gen2 BattleState UI object itself (self), which has no
-  -- top-level .enemy field the way Gen 1's BattleState does -- R39's own
-  -- "battle.enemy.mon" shape is Gen-1-only; Gold's real path is
-  -- self.battle.enemy, same shape :activeMon("enemy") reads from.
+  -- Enemy HUD's row-1 gap left of "<LV>" (tile 1,1 / pixel 8,8), blank in
+  -- vanilla. Gen2 BattleState has no .enemy field like Gen1's; use activeMon.
   mod.hooks:wrap("battle.overlay", function(next_, battleState)
     next_(battleState)
     if not (battleState and battleState.activeMon) then return end
-    -- Same gate drawEnemyHud itself uses (BattleState.lua:4201): without it
-    -- the glyph draws through the send-out intro, before the HUD it sits
-    -- next to has even slid on screen.
+    -- Same visibility gate drawEnemyHud itself uses.
     local visible = (not battleState.statusHUDVisible
         or battleState:statusHUDVisible())
       and battleState.showEnemyHud
@@ -2938,7 +3104,7 @@ local function setupWild(mod, Chain, Roamers)
     return next_(tables, ctx)
   end)
 
-  -- Wild mons are solid now; this only handles the player's bump and wander/habitat rules.
+  -- Wild mons are solid now: this hook only enforces wander/habitat rules.
   mod.hooks:wrap("movement.collision", function(next_, allowed, ctx)
     if not (activeMapId and ctx.map) then return next_(allowed, ctx) end
     local mover = ctx.mover
@@ -2976,6 +3142,7 @@ local function setupWild(mod, Chain, Roamers)
     else
       if onWater then return next_(false, ctx) end
       if isFillerCell(map, tx, ty) then return next_(false, ctx) end
+      if isIceHazardCell(map, tx, ty) then return next_(false, ctx) end
       if map.isGrassCell and isEncounterGrassCell(map, mover.cellX, mover.cellY)
           and not isEncounterGrassCell(map, tx, ty) then
         return next_(false, ctx)
@@ -2992,6 +3159,7 @@ local function setupWild(mod, Chain, Roamers)
 
   mod.log:info("overworldmons: wild wanderers armed (pool %d, view radius %d, 1/%d cells)",
     POOL, visibleCellRadius(), CELLS_PER)
+  return tickWildStep
 end
 
 return function(mod)
@@ -3051,14 +3219,42 @@ return function(mod)
 
   local Chain = setupChain(mod)
 
-  setupFollower(mod)
+  -- Each setupX returns a tick function (nil if it can't arm), sequenced
+  -- from one "input.step" registration below instead of N separate hooks.
+  local tickFollower = setupFollower(mod)
   setupPokecenterFollowerHide(mod, Specials)
-  setupFollowerEmotes(mod)
+  local tickFollowerEmotes = setupFollowerEmotes(mod)
   setupFollowerForaging(mod)
-  setupFollowerInteraction(mod)
-  setupWild(mod, Chain, Roamers)
-  setupOverworldReskin(mod)
-  setupObjectOverrides(mod)
-  setupReskinBounceFix(mod)
-  setupDaycareReskin(mod)
+  local tickFollowerText = setupFollowerInteraction(mod)
+  local tickWild = setupWild(mod, Chain, Roamers)
+  local tickOverworldReskin = setupOverworldReskin(mod)
+  local tickObjectOverrides = setupObjectOverrides(mod)
+  setupReskinNpcFixups(mod)
+  setupReskinFacePlayer(mod)
+  local tickDaycare = setupDaycareReskin(mod)
+
+  mod.hooks:wrap("input.step", function(next_, game, dt)
+    -- Order preserves the original per-hook execution order (verified
+    -- against LuaJIT's non-stable table.sort of equal-priority hooks).
+    -- safeTick keeps each tick's own pcall boundary so one throwing hook
+    -- doesn't skip every hook listed after it.
+    local function safeTick(name, fn)
+      if not fn then return end
+      local ok, err = pcall(fn, game, dt)
+      if not ok then
+        mod.log:warn("overworldmons: %s threw: %s", name, tostring(err))
+      end
+    end
+
+    safeTick("tickObjectOverrides", tickObjectOverrides)
+    safeTick("tickOverworldReskin", tickOverworldReskin)
+
+    next_(game, dt)
+
+    safeTick("tickWild", tickWild)
+    safeTick("tickFollowerText", tickFollowerText)
+    safeTick("tickFollowerEmotes", tickFollowerEmotes)
+    safeTick("tickDaycare", tickDaycare)
+    safeTick("tickFollower", tickFollower)
+  end)
 end
