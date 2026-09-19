@@ -7,7 +7,7 @@ Every Pokémon you could encounter in an area, including roamers, is out there w
 - **Wild wanderers:** every Pokémon available in the current area (grass, water - including fishing if you have the necessary rod, roamers, all of it) wanders the overworld for real. Touch one to battle it.
 - **Shinies:** shiny wild Pokémon and shiny followers show their proper shiny palette and sparkle on sight, no surprises saved for the battle screen.
 - **Chaining:** keep encountering the same species back to back and your odds of good DVs, and eventually a shiny, climb the longer the streak goes.
-- **Followers:** your first healthy party Pokémon follows you around in GBC style, including swimming when it can and waiting on shore when it can't. It reacts to you with emoticons based on how friendly it is, forages for items as you walk, and comments on where you are and what's around you. There's more planned for this system.
+- **Followers:** a demake of HGSS's walking Pokémon, running on this Gen 2 engine. A party Pokémon follows you around, swims when it can, hides when it can't, and walks in place when you stop. It reacts to you with emoticons based on how friendly it is, forages for items as you walk, and comments on where you are and what's around you. Select on the party screen changes who's following, or turns it off; a heart marks whoever it is.
 
 ## Install
 
