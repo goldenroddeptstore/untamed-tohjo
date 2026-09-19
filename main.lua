@@ -42,10 +42,21 @@ local function formOf(dex, mon)
   return reader and reader(mon) or nil
 end
 
+-- mon._owmFollow / save._owmNoFollow (set by setupFollowerSelect) override the default first-alive pick.
 local function leadMon(mod, game, world)
   local save = (game and game.save) or (world and world.save)
   local party = save and save.party
   if type(party) ~= "table" or #party == 0 then return nil end
+  local chosen = false
+  for _, mon in ipairs(party) do
+    if mon and mon._owmFollow then
+      chosen = true
+      if (mon.hp or 0) > 0 then
+        return mon, (mon.species and mod.content.pokemon:get(mon.species)) or nil
+      end
+    end
+  end
+  if chosen or (save and save._owmNoFollow) then return nil end
   for _, mon in ipairs(party) do
     if mon and (mon.hp or 0) > 0 then
       return mon, (mon.species and mod.content.pokemon:get(mon.species)) or nil
@@ -831,6 +842,83 @@ local function setupFollower(mod)
   return tickFollower
 end
 
+-- Select on the field party list (never a battle/item mon picker) toggles the highlighted mon as follower.
+local function setupFollowerSelect(mod)
+  local ok, PartyMenuMod = pcall(require, "src.ui.gen2.PartyMenu")
+  if not (ok and type(PartyMenuMod) == "table" and PartyMenuMod.update) then
+    mod.log:info("overworldmons: no src.ui.gen2.PartyMenu seam; follower "
+      .. "can't be picked from the party screen")
+    return
+  end
+  if PartyMenuMod.__owmFollowSelectHooked then return end
+  PartyMenuMod.__owmFollowSelectHooked = true
+
+  local function isFieldList(self)
+    return self.wantsSubmenu and not self.wantsBattleSubmenu
+      and not self.submenu and not self.switchFrom and not self.softboiledFrom
+      and not self.itemResult
+  end
+
+  local originalUpdate = PartyMenuMod.update
+  PartyMenuMod.update = function(self, dt)
+    if isFieldList(self) and not self:isCancel() then
+      local input = self.game and self.game.input
+      local mon = self.party and self.party[self.index]
+      if input and mon and input:wasPressed("select") then
+        local save = self.save or (self.game and self.game.save)
+        if mon._owmFollow then
+          mon._owmFollow = nil
+          if save then save._owmNoFollow = true end
+        else
+          for _, m in ipairs(self.party) do m._owmFollow = nil end
+          mon._owmFollow = true
+          if save then save._owmNoFollow = nil end
+        end
+        return
+      end
+    end
+    return originalUpdate(self, dt)
+  end
+
+  local heartImage
+  local function loadHeartImage()
+    if heartImage ~= nil then return heartImage or nil end
+    local ok3, result = pcall(function()
+      if not (love and love.image and love.graphics) then error("no love.graphics") end
+      local data = love.image.newImageData(mod.assets:path("assets/vfx/follow_heart.png"))
+      return love.graphics.newImage(data)
+    end)
+    if not ok3 then
+      mod.log:error("overworldmons: follow-heart image load failed: " .. tostring(result))
+    end
+    heartImage = ok3 and result or false
+    return heartImage or nil
+  end
+
+  -- drawPanel, not draw: PartyMenu.drawsWidescreen()==true means drawWidescreen (which calls drawPanel) runs instead of draw on screen.
+  local originalDrawPanel = PartyMenuMod.drawPanel
+  PartyMenuMod.drawPanel = function(self)
+    originalDrawPanel(self)
+    local party = self.party
+    if type(party) ~= "table" then return end
+    local img = loadHeartImage()
+    if not img then return end
+    for i, mon in ipairs(party) do
+      if mon and mon._owmFollow then
+        -- Column 3: past the icon's slide range (col <=2) and short of the status/FNT code at col 5-7.
+        local dataY = 2 + (i - 1) * 2
+        love.graphics.push("all")
+        love.graphics.setColor(1, 1, 1, 1)
+        love.graphics.draw(img, 3 * 8, dataY * 8)
+        love.graphics.pop()
+        break
+      end
+    end
+  end
+
+  mod.log:info("overworldmons: follower select armed (party screen, Select)")
+end
+
 local function setupPokecenterFollowerHide(mod, Specials)
   if not (Specials and Specials.ALL and Specials.ALL.HealParty) then
     mod.log:info("overworldmons: no gen2 Specials.HealParty seam; follower "
@@ -1387,9 +1475,7 @@ local function setupChain(mod)
 
   mod.events:on("battle.started", function(ev)
     if not ev then return end
-    if ev.kind == "trainer" then
-      reset()
-    elseif ev.kind == "wild" then
+    if ev.kind == "wild" then
       pendingWildSpecies = ev.species
     end
   end)
@@ -1640,25 +1726,58 @@ local function setupObjectOverrides(mod)
     end
   end)
 
+  local watchClock = 0
+  local WATCH_INTERVAL = 0.25
+
   local function tickObjectOverrides(game, dt)
-    if #pending == 0 then return end
     local world = mod.game and mod.game.world
-    if not (world and world.map and world.map.id == activeMapId) then
-      pending = {}
-      return
-    end
-    local stillPending = {}
-    for _, o in ipairs(pending) do
-      local status, applyErr = attemptApply(o)
-      if status == "ok" then
-        mod.log:info("overworldmons: %s reskinned", o.label)
-      elseif status == "retry" then
-        stillPending[#stillPending + 1] = o
+    local onActiveMap = world and world.map and world.map.id == activeMapId
+
+    if #pending > 0 then
+      if not onActiveMap then
+        pending = {}
       else
-        mod.log:warn("overworldmons: %s override failed: %s", o.label, tostring(applyErr))
+        local stillPending = {}
+        for _, o in ipairs(pending) do
+          local status, applyErr = attemptApply(o)
+          if status == "ok" then
+            mod.log:info("overworldmons: %s reskinned", o.label)
+          elseif status == "retry" then
+            stillPending[#stillPending + 1] = o
+          else
+            mod.log:warn("overworldmons: %s override failed: %s", o.label, tostring(applyErr))
+          end
+        end
+        pending = stillPending
       end
     end
-    pending = stillPending
+
+    -- A mid-script `reloadmap`/`refreshmap` rebuilds every NPC straight from
+    -- the map's raw def (World:rebuildPeople) and fires no "map.entered", so
+    -- an override applied once at map-entry can get silently overwritten by
+    -- the vanilla sprite the moment an NPC's dialogue triggers one (e.g. the
+    -- Ilex Forest Farfetch'd reverting to a generic bird after its first
+    -- interaction). Re-verify periodically, same as setupDaycareReskin's
+    -- tick, so drift like that gets corrected within a fraction of a second
+    -- instead of only ever being set once.
+    watchClock = watchClock + (dt or 0)
+    if watchClock < WATCH_INTERVAL then return end
+    watchClock = watchClock % WATCH_INTERVAL
+    if not onActiveMap then return end
+    for _, o in ipairs(OBJECT_OVERRIDES) do
+      if o.mapId == activeMapId and o.def then
+        local h = mod.world:npc(o.mapId, o.index)
+        local npc = h and h.npc
+        if npc and npc.spriteDef ~= o.def then
+          local status, applyErr = attemptApply(o)
+          if status == "ok" then
+            mod.log:info("overworldmons: %s re-applied after drift", o.label)
+          elseif status == "error" then
+            mod.log:warn("overworldmons: %s re-apply failed: %s", o.label, tostring(applyErr))
+          end
+        end
+      end
+    end
   end
   return tickObjectOverrides
 end
@@ -2992,7 +3111,14 @@ local function setupWild(mod, Chain, Roamers)
     if not visible then return end
     local enemyMon = battleState:activeMon("enemy")
     if enemyMon and enemyMon.shiny and mod.ui and mod.ui.Font then
-      mod.ui.Font.draw(SHINY_GLYPH_SEQ, 8, 8)
+      -- Tile (1,1) - pixel (8,8) - is CheckCaughtMon's own slot for the
+      -- "already owned" ball icon (BattleState:drawEnemyHud ->
+      -- BattleHud:drawCaughtIcon(1, 1, ...)); drawing the shiny glyph there
+      -- stacked it directly on top of that icon for an already-caught
+      -- shiny. Columns 10-11 of that row sit past the level/gender glyphs
+      -- (level tops out at column 8, gender symbol is column 9) and before
+      -- the border starts at row 2, so tile (10,1) - pixel (80,8) - is free.
+      mod.ui.Font.draw(SHINY_GLYPH_SEQ, 80, 8)
     end
   end)
 
@@ -3140,6 +3266,7 @@ return function(mod)
   local Chain = setupChain(mod)
 
   local tickFollower = setupFollower(mod)
+  setupFollowerSelect(mod)
   setupPokecenterFollowerHide(mod, Specials)
   local tickFollowerEmotes = setupFollowerEmotes(mod)
   setupFollowerForaging(mod)
