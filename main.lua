@@ -388,6 +388,8 @@ local pendingHealBall = false
 local followerBootSpawn = false
 local pendingHandoff, pendingConnectionOffset
 local hideFollowerEmote, npcHasActiveEmote
+local ownEmote = nil
+local emotePersistent = false
 
 local function currentFollowerHandle(mod)
   return followerNpcRef
@@ -572,6 +574,17 @@ local function updatePokeballDrop(mod, dt)
 end
 
 local function setupFollower(mod)
+  -- follower npc is torn down/rebuilt on every map change; carry the persistent emote across.
+  local pendingEmote
+
+  local function reattachPendingEmote(world, npc)
+    if not (pendingEmote and world and npc) then return end
+    ownEmote = { image = pendingEmote.image, entity = npc, left = pendingEmote.left }
+    world.emote = ownEmote
+    emotePersistent = true
+    pendingEmote = nil
+  end
+
   local function defFor(dex, terrain, form, shiny)
     return spriteDefFor(mod, "OWM_FOLLOWER_", dex, terrain, form, shiny)
   end
@@ -661,8 +674,10 @@ local function setupFollower(mod)
             cx, cy = p.cellX, p.cellY
           end
           spawnFollower(mod, mapId, cx, cy, p.facing)
+          reattachPendingEmote(world, currentFollowerHandle(mod))
         else
           spawnFollower(mod, mapId, p.cellX, p.cellY, p.facing)
+          reattachPendingEmote(world, currentFollowerHandle(mod))
         end
       end
       npc = currentFollowerHandle(mod)
@@ -792,6 +807,7 @@ local function setupFollower(mod)
       end
       local swims = onWater and canSwim(dexOfRec(rec) or FALLBACK_DEX, mon, rec)
       followerNpc.hiddenByMovement = (onWater and not swims) or nil
+      reattachPendingEmote(world, followerNpc)
     end
   end)
 
@@ -800,6 +816,8 @@ local function setupFollower(mod)
     local npc, p = currentFollowerHandle(mod), world and world.player
     pendingHandoff = (npc and p) and { dx = npc.cellX - p.cellX, dy = npc.cellY - p.cellY,
       wasOnWater = followerTerrain(world, npc) == "water" } or nil
+    pendingEmote = (emotePersistent and npc and npcHasActiveEmote(npc))
+      and { image = ownEmote.image, left = ownEmote.left } or nil
     despawnFollower(mod)
   end)
 
@@ -949,15 +967,14 @@ end
 local EMOTE_FRAME_W, EMOTE_FRAME_H, EMOTE_FRAMES = 16, 16, 14
 local EMOTE_DEFAULT_HOLD = 1.5
 
+-- index 12 is a duplicate ANGRY grimace, not a crown; left unmapped.
 local EMOTE = {
   SMILE = 0, EXCLAIM = 1, QUESTION = 2, BLOCK = 3, LIGHTNING = 4, FISH = 5,
   HEART = 6, ELLIPSIS = 7, MUSIC = 8, NEUTRAL = 9, SAD = 10, ANGRY = 11,
-  CROWN = 12, ZZZ = 13,
+  ZZZ = 13,
 }
 
 local emoteFrameCache = {}
-local ownEmote = nil
-local emotePersistent = false
 
 local function emoteFrameImage(mod, index)
   if emoteFrameCache[index] ~= nil then return emoteFrameCache[index] or nil end
@@ -1066,7 +1083,7 @@ local FORAGE_MAP_OVERRIDES = {
 
 local FORAGE_BASE_TIER = { emote = EMOTE.EXCLAIM, cry = "standard",
   text = "%s found something in the dirt!" }
-local FORAGE_RARE_TIER = { emote = EMOTE.CROWN, cry = "joyous",
+local FORAGE_RARE_TIER = { emote = EMOTE.MUSIC, cry = "joyous",
   text = "%s looks incredibly proud of what it found!" }
 local FORAGE_REFUSAL_TIER = { emote = EMOTE.ANGRY, cry = "standard",
   text = "%s found something... but refuses to share!" }
@@ -1155,7 +1172,7 @@ local function rollForage(mod, world, mon)
   forageState.ready, forageState.rare, forageState.itemName = true, rare, itemName
   local npc = currentFollowerHandle(mod)
   if npc then
-    showFollowerEmote(mod, world, npc, rare and EMOTE.CROWN or EMOTE.EXCLAIM,
+    showFollowerEmote(mod, world, npc, rare and EMOTE.MUSIC or EMOTE.EXCLAIM,
       { persistent = true })
   end
   mod.log:info("overworldmons: forage ready (%s%s)", itemName,
@@ -1442,6 +1459,7 @@ local function setupChain(mod)
 
   local function rollDVs(forSpecies, level, r, Mon)
     local dvs
+    local chainShiny = false
     if forSpecies == species and count > 0 then
       local denom = max(CHAIN_SHINY_FLOOR_DENOM,
         CHAIN_SHINY_BASE_DENOM - CHAIN_SHINY_STEP * count)
@@ -1451,6 +1469,7 @@ local function setupChain(mod)
           attack = CHAIN_SHINY_ATTACK_DVS[
             floor(r() * #CHAIN_SHINY_ATTACK_DVS) + 1],
         }
+        chainShiny = true
       else
         dvs = Mon.randomDVs()
         local k = chainFloorK(count)
@@ -1468,7 +1487,7 @@ local function setupChain(mod)
     end
     dvs.hp = Mon.hpDV(dvs)
     local shiny = Mon.isShiny(dvs, { species = forSpecies, level = level })
-    return dvs, shiny
+    return dvs, shiny, chainShiny
   end
 
   local pendingWildSpecies
@@ -1752,14 +1771,7 @@ local function setupObjectOverrides(mod)
       end
     end
 
-    -- A mid-script `reloadmap`/`refreshmap` rebuilds every NPC straight from
-    -- the map's raw def (World:rebuildPeople) and fires no "map.entered", so
-    -- an override applied once at map-entry can get silently overwritten by
-    -- the vanilla sprite the moment an NPC's dialogue triggers one (e.g. the
-    -- Ilex Forest Farfetch'd reverting to a generic bird after its first
-    -- interaction). Re-verify periodically, same as setupDaycareReskin's
-    -- tick, so drift like that gets corrected within a fraction of a second
-    -- instead of only ever being set once.
+    -- a mid-script reloadmap/refreshmap can silently revert an override with no map.entered; re-verify periodically.
     watchClock = watchClock + (dt or 0)
     if watchClock < WATCH_INTERVAL then return end
     watchClock = watchClock % WATCH_INTERVAL
@@ -1820,15 +1832,20 @@ local function setupReskinFacePlayer(mod)
 end
 
 local function setupWalkInPlace(mod)
-  local PREFIXES = { "OWM_WILD_", "OWM_FOLLOWER_", "OWM_OWMON_", "OWM_DAYCARE_" }
+  local PREFIXES = { "OWM_WILD_", "OWM_FOLLOWER_", "OWM_DAYCARE_" }
   local STEP_FRAMES = 32
   local BOB_PX = 2
+  -- excludes STILL/BIGDOLL* so PLAYERS_HOUSE_2F's decoration dolls stay motionless.
+  local MOVE_POKEMON = 0x16
 
   local function isCandidate(npc)
     local id = npc.spriteDef and npc.spriteDef.id
     if type(id) ~= "string" then return false end
     for _, prefix in ipairs(PREFIXES) do
       if id:find(prefix, 1, true) == 1 then return true end
+    end
+    if id:find(RESKIN_ID_PREFIX, 1, true) == 1 then
+      return npc.def and npc.def.movement == MOVE_POKEMON
     end
     return false
   end
@@ -2140,6 +2157,18 @@ local function setupWild(mod, Chain, Roamers)
     return coll and Permissions.ledgeFacings(coll)
   end
 
+  local function isCutTreeCell(map, cx, cy)
+    if not (Permissions and map.cellTile) then return false end
+    local coll = map:cellTile(cx, cy)
+    return coll ~= nil and Permissions.isCutTree(coll)
+  end
+
+  -- outermost cell ring is extraction padding on some maps (e.g. SILVER_CAVE_ROOM_1), never real play space.
+  local function isMapEdgeCell(map, cx, cy)
+    if not (map.widthCells and map.heightCells) then return false end
+    return cx == 0 or cy == 0 or cx == map.widthCells - 1 or cy == map.heightCells - 1
+  end
+
   local function localRegion(map, pcx, pcy)
     local land, water = {}, {}
     if not (map and map.isWalkableCell and map.widthCells) then
@@ -2151,13 +2180,14 @@ local function setupWild(mod, Chain, Roamers)
       if map:isWarpTileCell(x, y) then return "+" end
       if map:isWaterCell(x, y) then return "~" end
       if map:isWalkableCell(x, y) then
+        if isMapEdgeCell(map, x, y) then return " " end
         return isFillerCell(map, x, y) and " " or "."
       end
       return " "
     end
     local function passable(x, y)
       local c = kindAt(x, y)
-      return c == "." or c == "+" or c == "~"
+      return c == "." or c == "+" or c == "~" or isCutTreeCell(map, x, y)
     end
     local stack, seen = {}, {}
     if passable(pcx, pcy) then
@@ -2532,21 +2562,32 @@ local function setupWild(mod, Chain, Roamers)
     local level = levelFor(species, terrain == "water" and "water" or "grass", mapId)
     local sid = spriteId(slot)
     local dex = dexOf(species)
-    local dvs, shiny
+    local dvs, shiny, chainShiny
     if Mon then
       if Chain then
-        dvs, shiny = Chain.rollDVs(species, level, r, Mon)
+        dvs, shiny, chainShiny = Chain.rollDVs(species, level, r, Mon)
       else
         dvs = Mon.randomDVs(); dvs.hp = Mon.hpDV(dvs)
         shiny = Mon.isShiny(dvs, { species = species, level = level })
       end
       if shiny and liveShinyCount() >= MAX_LIVE_SHINIES then
-        shiny = false
+        shiny, chainShiny = false, false
         dvs = Mon.randomDVs(); dvs.hp = Mon.hpDV(dvs)
       end
     end
     local form
     if dex == UNOWN_DEX and Unown then
+      -- only a chained shiny's guaranteed DVs may bypass the Ruins puzzle lock.
+      if Mon and not chainShiny then
+        local save = mod.game and mod.game.save
+        local engineFlags = save and save.engineFlags
+        if not Unown.anyUnlocked(engineFlags) then return end
+        if not (dvs and Unown.letterUnlocked(Unown.letterFromDVs(dvs), engineFlags)) then
+          dvs = Unown.wildDVs(engineFlags, Mon.randomDVs)
+          dvs.hp = Mon.hpDV(dvs)
+          shiny = Mon.isShiny(dvs, { species = species, level = level })
+        end
+      end
       form = dvs and Unown.name(Unown.letterFromDVs(dvs))
         or Unown.name(floor(r() * Unown.NUM_UNOWN) + 1)
     end
@@ -3111,13 +3152,7 @@ local function setupWild(mod, Chain, Roamers)
     if not visible then return end
     local enemyMon = battleState:activeMon("enemy")
     if enemyMon and enemyMon.shiny and mod.ui and mod.ui.Font then
-      -- Tile (1,1) - pixel (8,8) - is CheckCaughtMon's own slot for the
-      -- "already owned" ball icon (BattleState:drawEnemyHud ->
-      -- BattleHud:drawCaughtIcon(1, 1, ...)); drawing the shiny glyph there
-      -- stacked it directly on top of that icon for an already-caught
-      -- shiny. Columns 10-11 of that row sit past the level/gender glyphs
-      -- (level tops out at column 8, gender symbol is column 9) and before
-      -- the border starts at row 2, so tile (10,1) - pixel (80,8) - is free.
+      -- tile (1,1) is the caught-ball icon's slot; (10,1) is clear of it and the level/gender glyphs.
       mod.ui.Font.draw(SHINY_GLYPH_SEQ, 80, 8)
     end
   end)
@@ -3172,6 +3207,8 @@ local function setupWild(mod, Chain, Roamers)
     local map = ctx.map
     local tx, ty = ctx.toX, ctx.toY
     local onWater = map.isWaterCell and map:isWaterCell(tx, ty) or false
+
+    if isMapEdgeCell(map, tx, ty) then return next_(false, ctx) end
 
     if self_.terrain == "water" then
       if not onWater then return next_(false, ctx) end
