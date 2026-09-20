@@ -1,22 +1,38 @@
+<div align="center">
+
 # Untamed Tohjo
 
-Every Pokémon you could encounter in an area, including roamers, is out there walking around on the overworld. Run into one and it starts a battle.
+![Untamed Tohjo Banner](UntamedTohjoBanner.gif)
+
+*Seamless overworld encounters for every wild Pokémon. Spot them on the map, track down roamers in real-time, and just walk up to start a battle.*
+
+</div>
 
 ## Features
 
-- **Wild wanderers:** every Pokémon available in the current area (grass, water - including fishing if you have the necessary rod, roamers, all of it) wanders the overworld for real. Touch one to battle it.
-- **Shinies:** shiny wild Pokémon and shiny followers show their proper shiny palette and sparkle on sight, no surprises saved for the battle screen.
-- **Chaining:** keep encountering the same species back to back and your odds of good DVs, and eventually a shiny, climb the longer the streak goes.
-- **Followers:** a demake of HGSS's walking Pokémon, running on this Gen 2 engine. A party Pokémon follows you around, swims when it can, hides when it can't, and walks in place when you stop. It reacts to you with emoticons based on how friendly it is, forages for items as you walk, and comments on where you are and what's around you. Select on the party screen changes who's following, or turns it off; a heart marks whoever it is.
+### Core Mechanics
+- **True Overworld Encounters:** Ditch the random grass encounters. Every wild Pokémon spawns directly on the map, including time-of-day specific spawns, surfing and fishing encounters (fishing mons are based on the rods you own), and wandering legendary roamers. 
+- **Expanded Dex Compatibility:** Built with full overworld sprite and mechanic support for every Pokémon up to Arceus. While the mod itself doesn't inject new species into the base game, it works flawlessly out-of-the-box with mods like *Kanto Reforged* meaning Hoenn species and beyond will seamlessly wander the overworld.
+- **Encounter Chaining:** Build a streak by continually battling or catching the same species. High chains guarantee better DVs and significantly boost shiny odds (up to ~1/100 at a 100 streak).
+- **Incense Menu:** Tailor the overworld to your playstyle via a new "Incense" option integrated directly into the Start Menu. Adjust spawn density (Low, Medium, High, Off) or use "Repel" mode to wipe standard encounters and exclusively hunt roamers.
 
-## Install
+### Immersive World
+- **Real-Time Shinies & Forms:** No battle-screen surprises. Shiny Pokémon display their exact palettes and sparkle directly on the overworld, complete with a custom shiny glyph in the battle HUD. Form differences like Unown letters also render correctly in the overworld.
+- **Living World Reskins:** Generic NPC sprites are gone. Town pets, event Pokemon (like Lance's Dragonite), and Pokémon left at the Daycare dynamically render as their exact species.
 
-Grab the latest packaged `.zip` from [Releases](../../releases), unzip it into your LÖVE save dir's `mods/` folder as `overworldmons` (desktop: `%APPDATA%\LOVE\pokemon-love2d\mods\overworldmons\`), enable it, boot Crystal, and load a save with a healthy lead. On mobile, import the `.zip` through the in-game mod manager instead.
+### HGSS-Style Followers
+- **Dynamic Companions:** Choose exactly who follows you. Press Select on the party screen to designate any party member (marked with a heart) as your follower, or turn the feature off entirely. Your companion seamlessly transitions to a swimming animation on water and retreats into its Pokéball during Pokémon Center heals.
+- **Context-Aware Reactions:** Interact with your follower to see custom emoticons based on their current HP, status ailments (like shivering when poisoned), and surrounding environment (e.g., Fire-types reacting poorly to rain).
+- **Foraging:** Walk long enough, and your follower will dig up items. Higher friendship yields rarer, location-specific loot like evolutionary stones; but unloved Pokémon might refuse to share their finds!
 
 ## Credits
 
-- Overworld sprites by **MegamanOmega**, with palette edits by **ShockSlayer** and the **Crystal Clear** team.
-- Pokéball drop sprite by **ShockSlayer** and the **Crystal Clear** team.
-- Emoticons by **FrenchOrange**.
-- Inspired by the **Wilds of Kanto** team's work.
-- Chaining system inspired by **Pokeabbie's Emerald Rogue**.
+- **MegamanOmega & FrenchOrange** - Overworld sprites
+- **ShockSlayer & the Crystal Clear team** - More overworld sprites and the Pokéball drop sprite
+- **FrenchOrange** - Emoticons
+
+## Inspirations
+- **ShockSlayer & the Crystal Clear team** - The amazing follower system was my baseline inspiration
+- **Wilds of Kanto team** - Inspiration for the wild encounter system
+- **Pokeabbie (Emerald Rogue)** - Inspiration for the encounter chaining system
+- **GameFreak and The Pokemon Company** - Duh.
