@@ -29,6 +29,7 @@
 
 - **MegamanOmega & FrenchOrange** - Overworld sprites
 - **ShockSlayer & the Crystal Clear team** - More overworld sprites and the Pokéball drop sprite
+- **Asef Ben-Non** - GHOST sprite
 - **FrenchOrange** - Emoticons
 
 ## Inspirations
