@@ -314,7 +314,6 @@ local function spriteDefFor(mod, idPrefix, dex, terrain, form, shiny)
         mod.log:error("overworldmons: sprite build failed for "
           .. key .. " (no sprite for this combo): " .. tostring(result))
       end
-      -- No device log access, so also keep the last failure for OWM DEBUG.
       RUNTIME.lastSpriteErr = key .. ": " .. tostring(result)
       RUNTIME.spriteImages[key] = false
       return nil
@@ -644,7 +643,6 @@ end
 local function setupFollower(mod)
   -- follower npc is torn down/rebuilt on every map change; carry the persistent emote across.
   local pendingEmote
-  -- Diagnostic for OWM DEBUG: last resolved follower species/dex.
   local followerDiag = { dex = nil, recOk = nil }
 
   local function reattachPendingEmote(world, npc)
@@ -1910,6 +1908,13 @@ local function setupOverworldReskin(mod)
         local def = spriteDefFor(mod, "OWM_OWMON_", dex, "land", nil, r.shiny)
         if not def then error("spriteDefFor returned nil") end
         RUNTIME.setSprite(mod, world, spriteId, def)
+        -- NPCs already spawned (save load) hold the bootstrap renderer; repaint them.
+        for _, npc in ipairs(world.npcs or {}) do
+          if npc.def and npc.def.sprite == spriteId and npc.setSpriteDef then
+            npc:setSpriteDef(def)
+            if world.applySpritePalette then world:applySpritePalette(npc) end
+          end
+        end
       end)
       if applyOk then
         patched = patched + 1
@@ -2134,9 +2139,7 @@ local function setupObjectOverrides(mod)
   local activeMapId
   local pending = {}
 
-  mod.events:on("map.entered", function(ev)
-    local mapId = ev and ev.mapId
-    if not mapId then return end
+  local function applyMap(mapId)
     activeMapId = mapId
     pending = {}
     for _, o in ipairs(OBJECT_OVERRIDES) do
@@ -2151,6 +2154,11 @@ local function setupObjectOverrides(mod)
         end
       end
     end
+  end
+
+  mod.events:on("map.entered", function(ev)
+    local mapId = ev and ev.mapId
+    if mapId then applyMap(mapId) end
   end)
 
   local watchClock = 0
@@ -2158,7 +2166,10 @@ local function setupObjectOverrides(mod)
 
   local function tickObjectOverrides(game, dt)
     local world = RUNTIME.liveWorld(mod, mod.game)
-    local onActiveMap = world and world.map and world.map.id == activeMapId
+    -- loading a save never fires map.entered, so adopt the live map here.
+    local liveId = world and world.map and world.map.id
+    if liveId and liveId ~= activeMapId then applyMap(liveId) end
+    local onActiveMap = liveId and liveId == activeMapId
 
     if #pending > 0 then
       if not onActiveMap then
@@ -2409,7 +2420,6 @@ local function setupWild(mod, Chain, Roamers, activeGen)
       { seq = SHINY_GLYPH_SEQ, code = SHINY_GLYPH_CODE })
   end
 
-  -- Diagnostic for OWM DEBUG: which seams below actually resolved.
   local wildDiag = { hOk = nil, defOk = nil, npcId = nil }
 
   -- Pokemon Tower's ghost disguise; reimplemented since our wanderers start
@@ -2544,6 +2554,36 @@ local function setupWild(mod, Chain, Roamers, activeGen)
 
   -- Tile-pair elevation collisions (cave ledges): certain adjacent tile-id
   -- pairs can't be crossed even though both are individually walkable.
+  local voidTileCache = {}
+  local function voidTileFor(pairs_, tileset)
+    if voidTileCache[tileset] ~= nil then return voidTileCache[tileset] or nil end
+    local candidates, first = nil, true
+    for _, p in ipairs(pairs_) do
+      if p.tileset == tileset then
+        if first then
+          candidates = { [p.a] = true, [p.b] = true }
+          first = false
+        else
+          if not candidates[p.a] then candidates[p.a] = nil end
+          if not candidates[p.b] then candidates[p.b] = nil end
+          for id in pairs(candidates) do
+            if id ~= p.a and id ~= p.b then candidates[id] = nil end
+          end
+        end
+      end
+    end
+    local result, count = false, 0
+    if candidates then
+      for id in pairs(candidates) do
+        result = id
+        count = count + 1
+      end
+    end
+    if count ~= 1 then result = false end
+    voidTileCache[tileset] = result
+    return result or nil
+  end
+
   local function landPairBlocked(map, sx, sy, tx, ty)
     local data = mod.game and mod.game.data
     local pairs_ = data and data.field and data.field.tilePairs
@@ -2556,6 +2596,8 @@ local function setupWild(mod, Chain, Roamers, activeGen)
         return true
       end
     end
+    local void = voidTileFor(pairs_, tileset)
+    if void ~= nil and a ~= b and (a == void or b == void) then return true end
     return false
   end
 
@@ -2577,7 +2619,8 @@ local function setupWild(mod, Chain, Roamers, activeGen)
     if map.blockId then
       return map:blockId(bx, by) == (map.borderBlock or 0)
     end
-    if map.blockAt and map.def and map.def.borderBlock ~= nil then
+    if map.blockAt and map.def and map.def.borderBlock ~= nil
+        and map.def.tileset == "CAVERN" then
       return map:blockAt(bx, by) == map.def.borderBlock
     end
     return false
@@ -2605,6 +2648,16 @@ local function setupWild(mod, Chain, Roamers, activeGen)
     if not (indoor and def and type(def.index) == "number") then return false end
     return def.index >= (indoor.firstIndoorMap or math.huge)
       and def.tileset ~= indoor.excludedTileset
+  end
+
+  -- Gen 1's isWaterCell falls back to a shared, non-tileset-specific tile-id
+  -- list, so building interiors whose own furniture/border tiles happen to
+  -- reuse those same ids (GATE, MUSEUM, POKECENTER, GYM, ...) misreport
+  -- real water. Real underground pools (CAVERN) still need it.
+  local function isWaterCapableMap(def)
+    if activeGen ~= 1 or not def then return true end
+    if def.tileset == "CAVERN" then return true end
+    return not isIndoorEncounterMap(def)
   end
 
   -- Same Gen2-only collision-byte scheme as EXTRA_GRASS_COLL above.
@@ -2750,16 +2803,31 @@ local function setupWild(mod, Chain, Roamers, activeGen)
     return cx == 0 or cy == 0 or cx == map.widthCells - 1 or cy == map.heightCells - 1
   end
 
+  local function boulderBlockedCells(map)
+    local blocked = {}
+    local objects = map.def and map.def.objects
+    if not objects then return blocked end
+    for _, o in ipairs(objects) do
+      if o.sprite == "SPRITE_BOULDER" and o.x and o.y then
+        blocked[o.y * 1024 + o.x] = true
+      end
+    end
+    return blocked
+  end
+
   local function localRegion(map, pcx, pcy)
     local land, water = {}, {}
     if not (map and map.isWalkableCell and map.widthCells) then
       return land, water
     end
     local W, H = map.widthCells, map.heightCells
+    local blockedByBoulder = boulderBlockedCells(map)
+    local waterCapable = isWaterCapableMap(map.def)
     local function kindAt(x, y)
       if x < 0 or y < 0 or x >= W or y >= H then return " " end
+      if blockedByBoulder[y * 1024 + x] then return " " end
       if map:isWarpTileCell(x, y) then return "+" end
-      if map:isWaterCell(x, y) then return "~" end
+      if waterCapable and map:isWaterCell(x, y) then return "~" end
       if map:isWalkableCell(x, y) then
         if isMapEdgeCell(map, x, y) then return " " end
         return isFillerCell(map, x, y) and " " or "."
@@ -2784,11 +2852,13 @@ local function setupWild(mod, Chain, Roamers, activeGen)
       elseif kind == "~" and not isWaterfallHazardCell(map, cx, cy) then
         water[#water + 1] = { cx, cy }
       end
-      for _, d in ipairs(NEIGH) do
-        local nx, ny = cx + d[1], cy + d[2]
-        local nk = ny * 1024 + nx
-        if not seen[nk] and crossable(map, cx, cy, d[3], nx, ny) and passable(nx, ny) then
-          seen[nk] = true; stack[#stack + 1] = nk
+      if kind ~= "+" then
+        for _, d in ipairs(NEIGH) do
+          local nx, ny = cx + d[1], cy + d[2]
+          local nk = ny * 1024 + nx
+          if not seen[nk] and crossable(map, cx, cy, d[3], nx, ny) and passable(nx, ny) then
+            seen[nk] = true; stack[#stack + 1] = nk
+          end
         end
       end
       local facings = (kind == ".") and ledgeFacingsAt(map, cx, cy) or nil
@@ -3261,7 +3331,6 @@ local function setupWild(mod, Chain, Roamers, activeGen)
           if not wildDiag.lastOwnsItem then ghost = true end
         end
       else
-        -- OWM DEBUG's box is only 18 chars wide; truncate hard, split over 2 lines below.
         wildDiag.lastGhostErr = tostring(gb):sub(1, 32)
         if not RUNTIME.warned.ghostBattles then
           RUNTIME.warned.ghostBattles = true
@@ -4136,79 +4205,7 @@ return function(mod)
   local tickDaycare = setupDaycareReskin(mod)
   local tickWalkInPlace = setupWalkInPlace(mod)
 
-  -- Diagnostic: safeTick below records the last error each guarded tick
-  -- threw, surfaced via the OWM DEBUG start-menu item below.
   local lastErr = {}
-
-  mod.hooks:wrap("ui.start_menu.items", function(next_, game, items)
-    local out = next_(game, items)
-    if type(out) ~= "table" then return out end
-    return mod.ui.insertBefore(out, "SAVE", {
-      label = "OWM DEBUG",
-      onSelect = function(g)
-        g = g or mod.game
-        local function yn(v) return v and "Y" or "N" end
-        local world = RUNTIME.liveWorld(mod, g)
-        local mon, rec = leadMon(mod, g, world)
-        local map = world and world.map
-        local p = world and world.player
-        local npc = currentFollowerHandle(mod)
-        local terrain = "?"
-        if map and p then
-          if map.isGrassCell and map:isGrassCell(p.cellX, p.cellY) then terrain = "grass"
-          elseif map.isWaterCell and map:isWaterCell(p.cellX, p.cellY) then terrain = "water"
-          else terrain = "other" end
-        end
-        local okT, TextBox = pcall(require, "src.render.TextBox")
-        if not (okT and TextBox and TextBox.new and g and g.stack) then return end
-        -- Bump on every ghost-fix iteration, to tell a fresh report apart
-        -- from a stale mod-cache install still running the previous build.
-        local BUILD_TAG = "ghost-r10-fix-2026-09-22"
-        local errPart1 = (wildDiag and wildDiag.lastGhostErr or "-"):sub(1, 16)
-        local errPart2 = (wildDiag and wildDiag.lastGhostErr or ""):sub(17, 32)
-        local text = addLineWaits(table.concat({
-          ("build=%s"):format(BUILD_TAG),
-          ("gFeat=%s gBS=%s"):format(yn(wildDiag and wildDiag.mapSeamOk),
-            yn(wildDiag and wildDiag.battleStateSeamOk)),
-          ("gMapId=%s"):format(tostring(wildDiag and wildDiag.lastMapId)),
-          ("gOk=%s gCfg=%s"):format(yn(wildDiag and wildDiag.lastGhostCheckOk),
-            tostring(wildDiag and wildDiag.lastGhostCfg)),
-          ("gOwns=%s gRes=%s"):format(tostring(wildDiag and wildDiag.lastOwnsItem),
-            yn(wildDiag and wildDiag.lastGhost)),
-          ("gErr1:" .. errPart1),
-          ("gErr2:" .. errPart2),
-          ("arm=%s g#=%s w#=%s"):format(yn(wildDiag and wildDiag.armOk),
-            tostring(wildDiag and wildDiag.armGrassSpecies),
-            tostring(wildDiag and wildDiag.armWaterSpecies)),
-          ("att=%s ok=%s"):format(tostring(wildDiag and wildDiag.spawnAttempts or 0),
-            tostring(wildDiag and wildDiag.spawnSuccesses or 0)),
-          ("bail=%s"):format(tostring(wildDiag and wildDiag.lastBail or "-")),
-          ("rLand=%s rGrass=%s"):format(tostring(wildDiag and wildDiag.regionLandN),
-            tostring(wildDiag and wildDiag.regionGrassLandN)),
-          ("land=%s water=%s"):format(tostring(wildDiag and wildDiag.landN),
-            tostring(wildDiag and wildDiag.waterN)),
-          ("tset=%s"):format(tostring(wildDiag and wildDiag.mapTileset)),
-          ("idx=%s indr=%s"):format(tostring(wildDiag and wildDiag.mapIndex),
-            yn(wildDiag and wildDiag.isIndoor)),
-          ("hOk=%s defOk=%s"):format(yn(wildDiag and wildDiag.hOk),
-            yn(wildDiag and wildDiag.defOk)),
-          ("tickF=%s tickW=%s"):format(yn(tickFollower ~= nil), yn(tickWild ~= nil)),
-          ("lead=%s hp=%s"):format(tostring(mon and mon.species), tostring(mon and mon.hp)),
-          ("npc=%s"):format(tostring(npc ~= nil)),
-          ("map=%s cell=%s,%s t=%s"):format(tostring(map and map.id),
-            tostring(p and p.cellX), tostring(p and p.cellY), terrain),
-          ("pMove=%s pTgt=%s,%s"):format(tostring(p and p.moving),
-            tostring(p and p.targetX), tostring(p and p.targetY)),
-          ("live=%s wMap=%s"):format(tostring(wildDiag and wildDiag.liveCount),
-            tostring(wildDiag and wildDiag.activeMapId)),
-          ("evVia=%s"):format(tostring(wildDiag and wildDiag.evVia)),
-          ("errF=%s"):format(tostring(lastErr.tickFollower or "-")),
-          ("errW=%s"):format(tostring(lastErr.tickWild or "-")),
-        }, "\n"))
-        g.stack:push(TextBox.new(g, text))
-      end,
-    })
-  end)
 
   mod.hooks:wrap("input.step", function(next_, game, dt)
     local function safeTick(name, fn)
