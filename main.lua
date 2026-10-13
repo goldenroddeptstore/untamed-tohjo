@@ -3605,6 +3605,8 @@ local function setupWild(mod, Chain, Roamers, activeGen)
     if needFlood then
       regionLand, regionWater = localRegion(map, pcx, pcy)
       regionFloodAtX, regionFloodAtY = pcx, pcy
+      -- Patches/quota belong to the old flood; rebuild them below.
+      regionLandPatches, regionWaterPatches, regionTotalQuota = nil, nil, nil
 
       regionGrassLand = regionLand
       if #regionLand > 0 and map.isGrassCell then
@@ -3664,7 +3666,9 @@ local function setupWild(mod, Chain, Roamers, activeGen)
     if incenseMode == "repel" then return end
     if eligible == 0 then return end
 
-    if needFlood then
+    -- Not tied to needFlood: a flood that hit the repel/no-eligible early
+    -- return above never built patches, so the next topUp must build them.
+    if regionTotalQuota == nil then
       regionLandPatches = labelPatches(land)
       regionWaterPatches = labelPatches(water)
       regionTotalQuota = 0
@@ -3764,7 +3768,7 @@ local function setupWild(mod, Chain, Roamers, activeGen)
     mod.log:info(
       "overworldmons: %s topUp @%d,%d -> %d live (view=%d place=%d %d land / %d water cand, %d patches/%d quota)",
       activeMapId, pcx, pcy, #live, viewRadius, placementRadius, landCount, waterCount,
-      #allocs, regionTotalQuota)
+      #allocs, regionTotalQuota or 0)
   end
 
   mod.events:on("map.entered", function(ev)
