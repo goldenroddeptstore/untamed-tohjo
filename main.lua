@@ -1075,6 +1075,7 @@ local function setupPokecenterFollowerHide(mod, Specials, activeGen)
       local world = RUNTIME.liveWorld(mod, mod.game)
       local p = world and world.player
       if not p then return end
+      if not leadMon(mod, mod.game, world) then return end -- no follower should exist
       local cx, cy = behindPlayerCell(world, p)
       startPokeballDrop(mod, world.map and world.map.id, cx, cy, p.facing)
     end)
@@ -1503,14 +1504,18 @@ local function resolveForageTier(mod, mon)
   local ok, Bag = pcall(require, "src.inventory.Bag")
   local id = findForageItemId(data, itemName)
   local granted = false
+  local full = false
   if ok and Bag and Bag.add and id and save then
     local okAdd, addResult = pcall(Bag.add, save, id, 1, data)
     granted = okAdd and addResult and true or false
+    -- Bag.add returns false only when the item's pocket is full.
+    full = okAdd and addResult == false
   end
   if not granted then
-    mod.log:warn("overworldmons: forage item %q could not be granted (id=%s)",
-      tostring(itemName), tostring(id))
-    return FORAGE_NOROOM_TIER
+    mod.log:warn("overworldmons: forage item %q could not be granted (id=%s, full=%s)",
+      tostring(itemName), tostring(id), tostring(full))
+    -- Only claim "no room" when the bag really is full; otherwise fall through to the other tiers.
+    return full and FORAGE_NOROOM_TIER or nil
   end
   local playerName = (save and save.player and save.player.name)
     or "You"
@@ -1647,6 +1652,14 @@ local function runFollowerInteraction(mod, world, npc, mon, rec)
     local function finish()
       followerInteractionBusy = false
       hideFollowerEmote(mod)
+      -- a health/status tier doesn't consume the pending forage; bring its cue back.
+      if forageState.ready then
+        local n = currentFollowerHandle(mod)
+        if n then
+          showFollowerEmote(mod, world, n, forageState.rare and EMOTE.MUSIC or EMOTE.EXCLAIM,
+            { persistent = true })
+        end
+      end
     end
     if tier.obtainedText then
       local obtainedText = addLineWaits(tier.obtainedText)
@@ -2230,6 +2243,16 @@ local function setupReskinNpcFixups(mod)
   mod.events:on("map.entered", function()
     scrub(RUNTIME.liveWorld(mod, mod.game))
   end)
+  -- loading a save never fires map.entered, so scrub the live map the first time it's seen.
+  local scrubbedMapId
+  return function()
+    local world = RUNTIME.liveWorld(mod, mod.game)
+    local liveId = world and world.map and world.map.id
+    if liveId and liveId ~= scrubbedMapId then
+      scrubbedMapId = liveId
+      scrub(world)
+    end
+  end
 end
 
 local function setupReskinFacePlayer(mod)
@@ -2261,8 +2284,8 @@ local function setupWalkInPlace(mod)
   -- bob needs an explicit pose() override on Gen 1, mirrored below.
   local okNPC, NPC = pcall(require, "src.world.NPC")
 
-  -- npc.spriteDef is Gen2-only, so match on npc.def.sprite (the spawn slot
-  -- id, set on both gens) instead; vanilla NPC-mon reskins still need spriteDef.id.
+  -- Match on npc.def.sprite (the spawn slot id, set on both gens) first;
+  -- vanilla NPC-mon reskins still need spriteDef.id (the Gen 1 setSpriteDef patch sets it too).
   local function isCandidate(npc)
     local slotId = npc.def and npc.def.sprite
     if type(slotId) == "string" then
@@ -2280,13 +2303,16 @@ local function setupWalkInPlace(mod)
   local function candidateFor(npc)
     local slotId = npc.def and npc.def.sprite
     local contentId = npc.spriteDef and npc.spriteDef.id
-    if npc._owmWalkCandidateSlot == slotId and npc._owmWalkCandidateKey == contentId then
+    local movement = npc.def and npc.def.movement
+    if npc._owmWalkCandidateSlot == slotId and npc._owmWalkCandidateKey == contentId
+        and npc._owmWalkCandidateMove == movement then
       return npc._owmWalkCandidate
     end
     local verdict = isCandidate(npc)
     npc._owmWalkCandidate = verdict
     npc._owmWalkCandidateSlot = slotId
     npc._owmWalkCandidateKey = contentId
+    npc._owmWalkCandidateMove = movement
     return verdict
   end
 
@@ -2442,29 +2468,16 @@ local function setupWild(mod, Chain, Roamers, activeGen)
     return owned == true or (type(owned) == "number" and owned > 0)
   end
 
-  local ENCOUNTER_KINDS = { "grass", "water" }
-  local encounterAliasDone = false
+  -- Gen 2's effectiveEncounters reads data.encounters, but the engine only
+  -- fills data.gen2Encounters. Point the alias at the live table on every
+  -- arm(): mod content is merged after load into a brand-new table, so a
+  -- one-time copy would miss maps and edits added by other mods.
   local function ensureEncounterAlias()
-    if encounterAliasDone then return end
     local gdata = mod.game and mod.game.data
     local gen2 = gdata and gdata.gen2Encounters
-    if not gen2 then return end
-    encounterAliasDone = true
-    gdata.encounters = gdata.encounters or {}
-    local filled = 0
-    for _, kind in ipairs(ENCOUNTER_KINDS) do
-      local maps = gen2[kind]
-      if type(maps) == "table" then
-        gdata.encounters[kind] = gdata.encounters[kind] or {}
-        for mapId, tbl in pairs(maps) do
-          if gdata.encounters[kind][mapId] == nil then
-            gdata.encounters[kind][mapId] = tbl
-            filled = filled + 1
-          end
-        end
-      end
-    end
-    mod.log:info("overworldmons: backfilled %d data.encounters[kind][mapId] slots from gen2Encounters", filled)
+    if not gen2 or gdata.encounters == gen2 then return end
+    gdata.encounters = gen2
+    mod.log:info("overworldmons: data.encounters now aliases gen2Encounters")
   end
   ensureEncounterAlias()
 
@@ -2556,6 +2569,7 @@ local function setupWild(mod, Chain, Roamers, activeGen)
   -- pairs can't be crossed even though both are individually walkable.
   local voidTileCache = {}
   local function voidTileFor(pairs_, tileset)
+    if tileset == nil then return nil end
     if voidTileCache[tileset] ~= nil then return voidTileCache[tileset] or nil end
     local candidates, first = nil, true
     for _, p in ipairs(pairs_) do
@@ -2758,7 +2772,11 @@ local function setupWild(mod, Chain, Roamers, activeGen)
     local save = game and game.save
     if not (data and save and save.inventory and save.party) then return false end
     local okFD, FieldDefaults = pcall(require, "src.world.FieldDefaults")
-    local gate = okFD and (FieldDefaults.constant(data, "hmBadges") or {}).CUT
+    local okC, hm = false, nil
+    if okFD and type(FieldDefaults) == "table" and FieldDefaults.constant then
+      okC, hm = pcall(FieldDefaults.constant, data, "hmBadges")
+    end
+    local gate = okC and type(hm) == "table" and hm.CUT
     local badge = gate and gate.badge
     if badge and not save.inventory[badge] then return false end
     for _, mon in ipairs(save.party) do
@@ -2826,7 +2844,7 @@ local function setupWild(mod, Chain, Roamers, activeGen)
     local function kindAt(x, y)
       if x < 0 or y < 0 or x >= W or y >= H then return " " end
       if blockedByBoulder[y * 1024 + x] then return " " end
-      if map:isWarpTileCell(x, y) then return "+" end
+      if map.isWarpTileCell and map:isWarpTileCell(x, y) then return "+" end
       if waterCapable and map:isWaterCell(x, y) then return "~" end
       if map:isWalkableCell(x, y) then
         if isMapEdgeCell(map, x, y) then return " " end
@@ -2929,9 +2947,12 @@ local function setupWild(mod, Chain, Roamers, activeGen)
       sumFloors = sumFloors + a.alloc
     end
     local remaining = need - sumFloors
-    table.sort(allocs, function(x, y) return x.remainder > y.remainder end)
+    -- sort a copy so the caller's patch order is left alone
+    local byRemainder = {}
+    for i, a in ipairs(allocs) do byRemainder[i] = a end
+    table.sort(byRemainder, function(x, y) return x.remainder > y.remainder end)
     for i = 1, remaining do
-      if allocs[i] then allocs[i].alloc = allocs[i].alloc + 1 end
+      if byRemainder[i] then byRemainder[i].alloc = byRemainder[i].alloc + 1 end
     end
   end
 
@@ -2952,7 +2973,11 @@ local function setupWild(mod, Chain, Roamers, activeGen)
     local inv = save and save.inventory
     if not (data and inv) then return nil, nil end
     local okFD, FieldDefaults = pcall(require, "src.world.FieldDefaults")
-    local fishing = okFD and FieldDefaults.field(data, "fishing")
+    local fishing
+    if okFD and type(FieldDefaults) == "table" and FieldDefaults.field then
+      local okF, f = pcall(FieldDefaults.field, data, "fishing")
+      fishing = okF and f or nil
+    end
     if not fishing then return nil, nil end
 
     local dist, levelSum, levelWt = {}, {}, {}
@@ -3277,6 +3302,40 @@ local function setupWild(mod, Chain, Roamers, activeGen)
     })
   end)
 
+  -- Shiny sparkle overlay NPC riding on a wanderer's cell; shared by wild spawns and roamers.
+  local function attachSparkle(entry, mapId, cell, world)
+    local sSlot = freeSparkleSlot()
+    local sDef = sSlot and buildSparkleDef(mod)
+    if sSlot and sDef then
+      sparkleSlotUsed[sSlot] = true
+      local sSid = sparkleSpriteId(sSlot)
+      RUNTIME.setSprite(mod, world, sSid, sDef)
+      local sNpcId = mod.world:spawnNpc(mapId, {
+        sprite = sSid, x = cell[1], y = cell[2],
+        movement = 6, radius = { x = 0, y = 0 },
+      })
+      if type(sNpcId) == "string" then
+        local sIndex = tonumber(sNpcId:match("_obj_(%d+)$"))
+        local sh = sIndex and mod.world:npc(mapId, sIndex)
+        if sh and sh.npc then
+          sh.npc.passable = true
+          if world and world.applySpritePalette then world:applySpritePalette(sh.npc) end
+        end
+        entry.sparkleNpcId, entry.sparkleIndex, entry.sparkleSlot =
+          sNpcId, sIndex, sSlot
+        entry.sparkleNpcRef = sh and sh.npc
+        entry.sparkleClock, entry.sparkleFrame = 0, 0
+        if entry.sparkleNpcRef then
+          -- Gen 2 draw reads bounceFrame(); Gen 1 draw reads frameOverride directly.
+          entry.sparkleNpcRef.bounceFrame = function() return entry.sparkleFrame end
+          entry.sparkleNpcRef.frameOverride = entry.sparkleFrame
+        end
+      else
+        sparkleSlotUsed[sSlot] = nil
+      end
+    end
+  end
+
   local function spawnOne(mapId, cell, terrain, dist, r)
     wildDiag.spawnAttempts = (wildDiag.spawnAttempts or 0) + 1
     local slot = freeSlot()
@@ -3310,6 +3369,14 @@ local function setupWild(mod, Chain, Roamers, activeGen)
           dvs = Unown.wildDVs(engineFlags, Mon.randomDVs)
           dvs.hp = Mon.hpDV(dvs)
           shiny = Mon.isShiny(dvs, { species = species, level = level })
+          -- the re-roll can land shiny past the cap; re-roll until it doesn't.
+          for _ = 1, 16 do
+            if not (shiny and liveShinyCount() >= MAX_LIVE_SHINIES) then break end
+            dvs = Unown.wildDVs(engineFlags, Mon.randomDVs)
+            dvs.hp = Mon.hpDV(dvs)
+            shiny = Mon.isShiny(dvs, { species = species, level = level })
+          end
+          if shiny and liveShinyCount() >= MAX_LIVE_SHINIES then return end
         end
       end
       form = dvs and Unown.name(Unown.letterFromDVs(dvs))
@@ -3377,34 +3444,7 @@ local function setupWild(mod, Chain, Roamers, activeGen)
     liveById[npcId] = entry
     if shiny then
       mod.log:info("overworldmons: SHINY wild %s spawned on %s", species, mapId)
-      local sSlot = freeSparkleSlot()
-      local sDef = sSlot and buildSparkleDef(mod)
-      if sSlot and sDef then
-        sparkleSlotUsed[sSlot] = true
-        local sSid = sparkleSpriteId(sSlot)
-        RUNTIME.setSprite(mod, world, sSid, sDef)
-        local sNpcId = mod.world:spawnNpc(mapId, {
-          sprite = sSid, x = cell[1], y = cell[2],
-          movement = 6, radius = { x = 0, y = 0 },
-        })
-        if type(sNpcId) == "string" then
-          local sIndex = tonumber(sNpcId:match("_obj_(%d+)$"))
-          local sh = sIndex and mod.world:npc(mapId, sIndex)
-          if sh and sh.npc then
-            sh.npc.passable = true
-            if world and world.applySpritePalette then world:applySpritePalette(sh.npc) end
-          end
-          entry.sparkleNpcId, entry.sparkleIndex, entry.sparkleSlot =
-            sNpcId, sIndex, sSlot
-          entry.sparkleNpcRef = sh and sh.npc
-          entry.sparkleClock, entry.sparkleFrame = 0, 0
-          if entry.sparkleNpcRef then
-            -- Gen 2 draw reads bounceFrame(); Gen 1 draw reads frameOverride directly.
-            entry.sparkleNpcRef.bounceFrame = function() return entry.sparkleFrame end
-            entry.sparkleNpcRef.frameOverride = entry.sparkleFrame
-          end
-        end
-      end
+      attachSparkle(entry, mapId, cell, world)
     end
   end
 
@@ -3516,7 +3556,10 @@ local function setupWild(mod, Chain, Roamers, activeGen)
       sprite = sid, x = cell[1], y = cell[2],
       movement = wanderMovement(terrain), radius = RADIUS,
     })
-    if type(npcId) ~= "string" then return end
+    if type(npcId) ~= "string" then
+      slotUsed[rslot] = nil
+      return
+    end
     local npcIndex = tonumber(npcId:match("_obj_(%d+)$"))
     local h = npcIndex and mod.world:npc(activeMapId, npcIndex)
     if h and h.npc then
@@ -3533,6 +3576,7 @@ local function setupWild(mod, Chain, Roamers, activeGen)
     }
     live[#live + 1] = entry
     liveById[npcId] = entry
+    if shiny then attachSparkle(entry, activeMapId, cell, world) end
     mod.log:info("overworldmons: roamer %s appeared on %s (%d,%d)%s",
       species, activeMapId, cell[1], cell[2], shiny and " SHINY" or "")
   end
@@ -3789,6 +3833,7 @@ local function setupWild(mod, Chain, Roamers, activeGen)
   mod.events:on("map.exited", function()
     pending = nil
     pendingDvs = nil
+    pendingGhost = nil
     despawnAll()
     grassDist, waterDist, activeMapId = nil, nil, nil
     fishLevels = nil
@@ -3862,7 +3907,8 @@ local function setupWild(mod, Chain, Roamers, activeGen)
             wildDiag.lastGhostCfg = gb and (gb.unlessItem or "yes") or "no"
             wildDiag.lastGhostErr = nil
             if gb then
-              wildDiag.lastOwnsItem = ownsItem(mod.game and mod.game.save, gb.unlessItem)
+              local okOwn, owns = pcall(ownsItem, mod.game and mod.game.save, gb.unlessItem)
+              wildDiag.lastOwnsItem = okOwn and owns or false
               wildDiag.lastGhost = not wildDiag.lastOwnsItem
             else
               wildDiag.lastOwnsItem = nil
@@ -3971,7 +4017,8 @@ local function setupWild(mod, Chain, Roamers, activeGen)
       -- Gen 1's BattleState has no activeMon/showEnemyHud/hudCleared; mirror
       -- drawHUDs's own gate for the enemy HUD block instead.
       enemyMon = battleState.enemy and battleState.enemy.mon
-      visible = enemyMon ~= nil and battleState:statusHUDVisible()
+      visible = enemyMon ~= nil
+        and (not battleState.statusHUDVisible or battleState:statusHUDVisible())
         and not battleState.showEnemyTrainer
         and not battleState.enemySendingOut
         and not battleState.enemyHudPending
@@ -4111,7 +4158,7 @@ return function(mod)
         -- Also stamps mon.shiny (Gen 2's refreshStats does this too).
         refreshStats = function(mon, data)
           if type(mon) ~= "table" then return mon end
-          mon.shiny = mon.shiny or StatsMod.isShiny(mon.dvs)
+          if mon.dvs then mon.shiny = StatsMod.isShiny(mon.dvs) and true or false end
           local def = data and data.pokemon and data.pokemon[mon.species]
           if not (def and def.baseStats) then return mon end
           mon.stats = StatsMod.calc(def, mon.level or 1, mon.dvs or {}, mon.statExp)
@@ -4193,8 +4240,10 @@ return function(mod)
   local Chain = setupChain(mod)
 
   local tickFollower, followerDiag = setupFollower(mod)
-  setupFollowerSelect(mod, activeGen)
-  setupPokecenterFollowerHide(mod, Specials, activeGen)
+  if tickFollower then -- nil when follower sprite registration failed
+    setupFollowerSelect(mod, activeGen)
+    setupPokecenterFollowerHide(mod, Specials, activeGen)
+  end
   local tickFollowerEmotes = setupFollowerEmotes(mod)
   RUNTIME.setupGen1EmoteDraw(mod)
   RUNTIME.setupGen1TrueColorSprites(mod)
@@ -4204,7 +4253,7 @@ return function(mod)
   local tickWild, wildDiag = setupWild(mod, Chain, Roamers, activeGen)
   local tickOverworldReskin = setupOverworldReskin(mod)
   local tickObjectOverrides = setupObjectOverrides(mod)
-  setupReskinNpcFixups(mod)
+  RUNTIME.tickReskinScrub = setupReskinNpcFixups(mod)
   setupReskinFacePlayer(mod)
   local tickDaycare = setupDaycareReskin(mod)
   local tickWalkInPlace = setupWalkInPlace(mod)
@@ -4226,6 +4275,7 @@ return function(mod)
 
     next_(game, dt)
 
+    safeTick("tickReskinScrub", RUNTIME.tickReskinScrub)
     safeTick("tickWild", tickWild)
     safeTick("tickWalkInPlace", tickWalkInPlace)
     safeTick("tickFollowerText", tickFollowerText)
